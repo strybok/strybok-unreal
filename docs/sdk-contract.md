@@ -208,7 +208,7 @@ genuine build of the app on a genuine device. The proof is Apple **App Attest** 
 decision 0016; the limits an app developer should know
 are in [link-creation-security.md](./link-creation-security.md).
 
-**Which SDKs.** Attestation needs native platform code. It is planned for the native iOS SDK and
+**Which SDKs.** Attestation needs native platform code. It is implemented in the native iOS SDK and
 the Android / Kotlin Multiplatform SDKs. **An SDK without support simply never sends the
 `X-Strybok-Attestation` header** and changes nothing else; the server then treats the app
 according to the owner's setting (served, served from a small shared allowance, or refused with

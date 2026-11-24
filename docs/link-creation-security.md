@@ -6,7 +6,8 @@ default, and how to switch on extra protection for iOS and Android.
 
 > **Status:** the server side is built and covered by automated tests with synthetic data. It
 > has **not** been verified on a physical device or against Apple's and Google's real services,
-> and **no SDK supports the extra protection yet**. Read [the limits](#the-limits) before you
+> and the SDK support (native iOS, Android and Kotlin Multiplatform, from version 0.3.0) has only
+> been unit-tested with fakes: **no real App Attest or Play Integrity call has been made**. Read [the limits](#the-limits) before you
 > rely on it.
 
 ## The risk: the client key is public
@@ -89,8 +90,8 @@ create links at all; with **Preferred**, they share the small allowance.
    Attest**. This adds the `com.apple.developer.devicecheck.appattest-environment` entitlement.
    Xcode sets it to `development` for builds you run from Xcode; App Store and TestFlight builds
    always use `production`.
-3. Use an SDK version that supports attestation and switch its `attestation` option on. (None is
-   released yet.)
+3. Use the iOS SDK or the Kotlin Multiplatform SDK, version 0.3.0 or later, and switch its
+   `attestation` option on.
 4. While developing, tick **Accept development builds (iOS)** in the dashboard so builds run from
    Xcode are accepted. **Untick it before you rely on the protection**: a development build is
    easier to tamper with.
@@ -123,8 +124,10 @@ Google project, and the names of menus in Google's consoles change from time to 
    and select that file. The dashboard then shows "Google key: configured" with the service
    account's address.
 7. Delete the downloaded file from your computer.
-8. Use an SDK version that supports attestation, switch its `attestation` option on and give it
-   your Cloud **project number**. (None is released yet.)
+8. Use the Android SDK or the Kotlin Multiplatform SDK, version 0.3.0 or later: switch its
+   `attestation` option on and give its Play Integrity token provider your Cloud **project
+   number**. Add Google's `com.google.android.play:integrity` library to your app; the SDK does
+   not bring it.
 9. Test with a build **installed from Google Play** (an internal testing track is enough).
    Builds installed from Android Studio are not "recognised by Play" and will be refused.
 
@@ -178,8 +181,8 @@ impossible, and it can lock out real users.
   app from creating links. A proof can also be lifted from a device the attacker controls and
   used elsewhere; to bound that, one proof is good for at most **30 new links** and **one
   hour**.
-- **Not every SDK can do this.** Support is planned only for the native iOS SDK and the
-  Android / Kotlin Multiplatform SDKs. The Flutter, React Native, Capacitor, Unity, .NET and
+- **Not every SDK can do this.** Only the native iOS SDK and the Android / Kotlin
+  Multiplatform SDKs support it (from version 0.3.0). The Flutter, React Native, Capacitor, Unity, .NET and
   Unreal SDKs have no attestation code yet, so apps built with them count as "cannot attest".
 - **Not verified in the real world yet.** None of this has been tried on a physical device or
   against Apple's and Google's real services. Until it has, treat Required as experimental.
