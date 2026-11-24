@@ -7,7 +7,8 @@ It is the Unreal implementation of the [SDK contract](./sdk-contract.md).
 > **Status: not compiled against Unreal Engine yet.**
 >
 > - **Tested:** the engine-independent core (URL validation, lookup URL, retry and back-off,
->   response validation, duplicate protection, queue and exactly-once delivery, event body). It is
+>   response validation, duplicate protection, queue and exactly-once delivery, event body,
+>   creating links). It is
 >   plain C++ and has its own test suite that runs without the engine
 >   (`Tests/run_core_tests.sh` in the plugin directory).
 > - **Not tested:** the Unreal module around it (subsystem, HTTP, timers, Project Settings, the
@@ -86,6 +87,7 @@ LinkHost=my-app.strybok.link
 | `RetryDelaySeconds`      | `0.4`                     | Pause before the first retry; doubles for each further retry.                                |
 | `DedupeWindowSeconds`    | `2`                       | The identical URL received again within this window is dropped.                              |
 | `bReportAppOpens`        | `True`                    | Send a best-effort `app_open` event after a link was resolved.                               |
+| `ClientKey`              | empty                     | Publishable key `pk_…`, only for creating links to share (section 6).                        |
 
 While `LinkHost` is empty the SDK stays idle (one log line, no error). To choose the values at
 runtime instead, turn `bAutoConfigure` off and call `Configure` yourself (section 6).
@@ -335,6 +337,7 @@ Strybok->Configure(Config); // false + a log line when the values are unusable
 | `ResolveUrl(Url, OnComplete)`                                                    | Resolve a URL explicitly (QR scanner, tests). Does not fire `OnLinkReceived` or report an app open.    |
 | `HandleUrl(Url)`                                                                 | Manual entry point: same flow as a link from the OS. Buffered when called before `Configure`.          |
 | `IsStrybokUrl(Url)`                                                              | Whether a URL is one of this app's links.                                                              |
+| `CreateLink(Request, OnComplete)` / `CreateLinkNative(Request, Lambda)`          | Create a short link to share, see [below](#create-a-link-to-share).                                    |
 | `Shutdown()`                                                                     | Stop: nothing is delivered afterwards. Automatic when the game instance ends.                          |
 | `OnLinkReceivedNative()` / `OnLinkErrorNative()`                                 | C++ delegates for lambdas; the same stream.                                                            |
 | `FStrybokResolvedLink::GetPayloadString`, `GetPayloadObject`, `GetRouteSegments` | Helpers; `UStrybokBlueprintLibrary` exposes two of them to Blueprint.                                  |
@@ -344,6 +347,60 @@ together (the link is handed out once), but a bound `OnLinkReceived` normally ge
 first and `GetInitialLink` then completes with `bHasLink = false`.
 
 All functions are game-thread only; all delegates fire on the game thread.
+
+### Create a link to share
+
+`CreateLink` asks the service for a short link to a screen of your game — the "Share" button. It
+is new in 0.2.0. The rules behind it (checks, request, retries, errors) are in the tested core;
+the subsystem function around them is, like the rest of the module, **not compiled yet**.
+
+1. In the dashboard, open the application, switch on **Links from the app** and list the route
+   patterns the game may create links for (for example `/product/*`). Routes outside the list are
+   refused.
+2. Put the application's **publishable client key** (`pk_…`) into _Project Settings → Plugins →
+   Strybok → Client Key_ (`ClientKey=pk_…` in `DefaultGame.ini`), or into `FStrybokConfig`. The
+   key is safe to ship inside the game: it can only create links for those patterns. **Never put
+   a secret API key (`lb_…`) in a game**; it is not accepted here.
+
+```cpp
+FStrybokCreateLinkRequest Request;
+Request.RoutePath = TEXT("/product/42");
+Request.PayloadJson = TEXT("{\"productId\":42}"); // optional, must be a JSON object
+Request.Title = TEXT("Red shoes");               // optional
+
+Strybok->CreateLinkNative(Request, [](bool bSuccess, const FStrybokCreatedLink& Link, const FStrybokError& Error)
+{
+	if (bSuccess)
+	{
+		ShareText(Link.Url); // https://my-app.strybok.link/Ab3xK9
+	}
+	else if (Error.Kind == EStrybokErrorKind::RateLimited)
+	{
+		ShowTryAgainLater(Error.RetryAfterSeconds); // -1 when unknown
+	}
+});
+```
+
+In Blueprint call **Create Link** on the subsystem with a **Make Strybok Create Link Request**
+node and an event for `OnComplete`. Only the route is required; fields left empty are not sent.
+Asking again for the same content returns the same link.
+
+It only runs when you call it and is independent of receiving links: it works before and without
+`Configure` (then with the Project Settings; no `LinkHost` is needed), never fires
+`OnLinkReceived` or `OnLinkError`, and reports its result only through `OnComplete`:
+
+| `Kind`                           | Meaning                                                                                                             | Retry later?                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| `Unauthorized`                   | No client key set (no network call), or the key was refused: wrong or replaced key, or the feature is switched off. | no                             |
+| `RouteNotAllowed`                | `RoutePath` is not covered by the route patterns in the dashboard.                                                  | no                             |
+| `Validation`                     | Bad route or payload (no network call), or rejected by the service; `Issues` lists what it found.                   | no                             |
+| `RateLimited`                    | Too many requests, or the app's daily limit of new links is reached.                                                | yes, after `RetryAfterSeconds` |
+| `Network` / `Timeout` / `Server` | No usable answer after the retries (`TimeoutSeconds`, `MaxRetries`, `RetryDelaySeconds` as for resolving).          | yes                            |
+| `NotConfigured`                  | The API base URL is unusable.                                                                                       | no                             |
+
+Errors never contain the client key or the payload. `Shutdown`, a new `Configure` and the end of
+the game instance abandon requests in flight; their `OnComplete` is not called. Do not put
+personal data in a route or payload: whoever receives the link can read them.
 
 ## 7. Errors
 

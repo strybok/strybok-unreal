@@ -202,6 +202,8 @@ struct Reply
 	Kind kind = Kind::Respond;
 	int status = 200;
 	std::string body;
+	/** The `Retry-After` response header; empty for none. */
+	std::string retryAfter;
 };
 
 Reply Respond(int status, const std::string& body = std::string())
@@ -237,16 +239,26 @@ Reply Ok(const std::string& route = "/invite/abc123", const std::string& linkId 
 	return Respond(200, OkBody(route, linkId));
 }
 
+std::string CreatedBody(const std::string& route = "/product/42")
+{
+	return "{\"linkId\":\"link_9\",\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"slug\":\"Ab3xK9\",\"routePath\":\"" +
+		route + "\"}";
+}
+
 HttpResponse ToResponse(const Reply& reply)
 {
 	HttpResponse response;
 	response.transportOk = reply.kind == Reply::Kind::Respond;
 	response.statusCode = response.transportOk ? reply.status : 0;
 	response.body = reply.body;
+	response.retryAfter = reply.retryAfter;
 	return response;
 }
 
-/** Records requests and answers resolve calls with `onResolve` and event calls with `onEvent`. */
+/**
+ * Records requests and answers resolve calls with `onResolve`, event calls with `onEvent` and
+ * create-link calls with `onCreate`.
+ */
 class FakeApi final : public IHttpTransport
 {
 public:
@@ -254,12 +266,15 @@ public:
 
 	std::function<Reply(const HttpRequest&)> onResolve;
 	std::function<Reply()> onEvent;
+	std::function<Reply(const HttpRequest&)> onCreate;
 	/** Answer inside `Send` instead of on the next loop turn. */
 	bool synchronous = false;
 
 	std::vector<HttpRequest> resolves;
 	std::vector<HttpRequest> events;
 	std::vector<std::uint64_t> resolveIds;
+	std::vector<HttpRequest> creates;
+	std::vector<std::uint64_t> createIds;
 	std::vector<std::uint64_t> cancelled;
 
 	std::uint64_t Send(const HttpRequest& request, Callback onDone) override
@@ -268,11 +283,20 @@ public:
 		const std::string eventsSuffix = "/v1/public/events";
 		const bool isEvent = request.url.size() >= eventsSuffix.size() &&
 			request.url.compare(request.url.size() - eventsSuffix.size(), eventsSuffix.size(), eventsSuffix) == 0;
+		const std::string linksSuffix = "/v1/public/links";
+		const bool isCreate = request.url.size() >= linksSuffix.size() &&
+			request.url.compare(request.url.size() - linksSuffix.size(), linksSuffix.size(), linksSuffix) == 0;
 		Reply reply;
 		if (isEvent)
 		{
 			events.push_back(request);
 			reply = onEvent ? onEvent() : Respond(202);
+		}
+		else if (isCreate)
+		{
+			creates.push_back(request);
+			createIds.push_back(id);
+			reply = onCreate ? onCreate(request) : Respond(201, CreatedBody());
 		}
 		else
 		{
@@ -1481,7 +1505,7 @@ TEST(Events, SendsOneMinimalBestEffortEventPerDeliveredLink) // [ref]
 	EXPECT_EQ(StringMember(event, "type"), "app_open");
 	EXPECT_EQ(StringMember(event, "linkId"), "link_1");
 	EXPECT_EQ(StringMember(event, "platform"), "ios");
-	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.1.0");
+	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.2.0");
 	EXPECT_MSG(IsUuidV4(StringMember(event, "eventId")), StringMember(event, "eventId"));
 }
 
@@ -1575,8 +1599,8 @@ TEST(Events, UuidFormattingForcesVersionAndVariant)
 
 TEST(Events, BodyIsExactAndEscapedAndTheVersionIsCapped)
 {
-	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "0.1.0"),
-		"{\"eventId\":\"id-1\",\"linkId\":\"link_1\",\"type\":\"app_open\",\"platform\":\"android\",\"sdkVersion\":\"0.1.0\"}");
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "0.2.0"),
+		"{\"eventId\":\"id-1\",\"linkId\":\"link_1\",\"type\":\"app_open\",\"platform\":\"android\",\"sdkVersion\":\"0.2.0\"}");
 
 	json::Value event;
 	EXPECT(json::Parse(BuildAppOpenBody("id", "li\"nk\\\n", "unknown", std::string(40, 'v')), event));
@@ -1586,7 +1610,7 @@ TEST(Events, BodyIsExactAndEscapedAndTheVersionIsCapped)
 
 	EXPECT(json::Parse(BuildAppOpenBody("id", "l", "ios", ""), event));
 	EXPECT_EQ(StringMember(event, "sdkVersion"), std::string(kSdkVersion));
-	EXPECT_EQ(std::string(kSdkVersion), "0.1.0");
+	EXPECT_EQ(std::string(kSdkVersion), "0.2.0");
 }
 
 TEST(Events, AnInjectedRandomSourceIsUsed)
@@ -1758,6 +1782,869 @@ TEST(Dispose, DestroyingTheEngineFromInsideAnErrorHandlerIsSafe)
 	bridge.loop.Advance(10000);
 	EXPECT_EQ(calls, 1);
 	EXPECT(bridge.sdk == nullptr);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Creating links ("Creating links" in the SDK contract)
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+const std::string kClientKey = "pk_0123456789abcdefghijABCDEFGHIJ01";
+const std::string kSecretMarker = "SECRET-PAYLOAD-MARKER";
+
+struct ShareOptions
+{
+	int maxRetries = 2;
+	std::int64_t timeoutMs = 60;
+	std::int64_t retryDelayMs = 1;
+	std::string apiBaseUrl = kApi;
+	std::string clientKey = kClientKey;
+};
+
+/** A `LinkCreator` wired to fakes. No `LinkEngine` exists, so nothing was initialized or started. */
+struct Share
+{
+	FakeLoop loop;
+	FakeApi api{loop};
+	std::unique_ptr<LinkCreator> creator;
+
+	explicit Share(const ShareOptions& options = ShareOptions())
+	{
+		Config config;
+		config.apiBaseUrl = options.apiBaseUrl;
+		config.clientKey = options.clientKey;
+		config.timeoutMs = options.timeoutMs;
+		config.maxRetries = options.maxRetries;
+		config.retryDelayMs = options.retryDelayMs;
+		// allowedHosts stays empty on purpose: creating links does not need it.
+		creator.reset(new LinkCreator(config, api, loop));
+	}
+
+	struct Outcome
+	{
+		int calls = 0;
+		bool ok = false;
+		/** Whether the callback ran before `Create` returned. */
+		bool synchronous = false;
+		bool accepted = false;
+		CreatedLink link;
+		LinkError error;
+	};
+
+	Outcome Create(const CreateLinkParams& params, std::int64_t waitMs = 1000)
+	{
+		Outcome outcome;
+		outcome.accepted = creator->Create(params, [&outcome](const CreatedLink* link, const LinkError* error) {
+			++outcome.calls;
+			outcome.ok = link != nullptr && error == nullptr;
+			if (link != nullptr)
+			{
+				outcome.link = *link;
+			}
+			if (error != nullptr)
+			{
+				outcome.error = *error;
+			}
+		});
+		outcome.synchronous = outcome.calls == 1;
+		loop.Advance(waitMs);
+		return outcome;
+	}
+};
+
+CreateLinkParams Product()
+{
+	CreateLinkParams params;
+	params.routePath = "/product/42";
+	return params;
+}
+
+CreateLinkParams FullProduct()
+{
+	CreateLinkParams params;
+	params.routePath = "/product/42";
+	params.payloadJson = "{\"productId\":42,\"note\":\"" + kSecretMarker + "\"}";
+	params.title = "Red shoes";
+	params.description = "Look at these";
+	params.imageUrl = "https://cdn.example.com/shoes.png";
+	return params;
+}
+
+std::string Header(const HttpRequest& request, const std::string& name)
+{
+	std::string found = "<missing>";
+	int count = 0;
+	for (const auto& header : request.headers)
+	{
+		std::string lowered;
+		for (char c : header.first)
+		{
+			lowered.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+		}
+		if (lowered == name)
+		{
+			found = header.second;
+			++count;
+		}
+	}
+	return count > 1 ? std::string("<repeated>") : found;
+}
+
+std::set<std::string> Keys(const json::Value& object)
+{
+	std::set<std::string> keys;
+	for (const auto& member : object.members)
+	{
+		keys.insert(member.first);
+	}
+	return keys;
+}
+
+bool Mentions(const LinkError& error, const std::string& needle)
+{
+	if (error.message.find(needle) != std::string::npos || error.url.find(needle) != std::string::npos ||
+		error.routePath.find(needle) != std::string::npos)
+	{
+		return true;
+	}
+	for (const ValidationIssue& issue : error.issues)
+	{
+		if (issue.path.find(needle) != std::string::npos || issue.message.find(needle) != std::string::npos)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+TEST(CreateLink, Status201ReturnsTheCreatedLinkAndSendsTheContractRequest)
+{
+	Share share;
+	const Share::Outcome outcome = share.Create(FullProduct());
+
+	EXPECT(outcome.accepted);
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT(outcome.ok);
+	EXPECT(!outcome.synchronous);
+	EXPECT_EQ(outcome.link.url, "https://my-app.strybok.link/Ab3xK9");
+	EXPECT_EQ(outcome.link.slug, "Ab3xK9");
+	EXPECT_EQ(outcome.link.routePath, "/product/42");
+	EXPECT_EQ(outcome.link.linkId, "link_9");
+
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+	const HttpRequest& request = share.api.creates[0];
+	EXPECT_EQ(request.method, "POST");
+	EXPECT_EQ(request.url, "https://api.strybok.com/v1/public/links");
+	EXPECT_EQ(request.headers.size(), static_cast<std::size_t>(3));
+	EXPECT_EQ(Header(request, "content-type"), "application/json");
+	EXPECT_EQ(Header(request, "accept"), "application/json");
+	EXPECT_EQ(Header(request, "x-strybok-key"), kClientKey);
+	EXPECT_EQ(Header(request, "authorization"), "<missing>");
+	EXPECT(request.url.find(kClientKey) == std::string::npos);
+	EXPECT(request.body.find(kClientKey) == std::string::npos);
+
+	EXPECT_EQ(request.body,
+		"{\"routePath\":\"/product/42\",\"payload\":{\"productId\":42,\"note\":\"SECRET-PAYLOAD-MARKER\"},"
+		"\"title\":\"Red shoes\",\"description\":\"Look at these\",\"imageUrl\":\"https://cdn.example.com/shoes.png\"}");
+	json::Value body;
+	EXPECT(json::Parse(request.body, body));
+	const std::set<std::string> expectedKeys = {"routePath", "payload", "title", "description", "imageUrl"};
+	EXPECT(Keys(body) == expectedKeys);
+
+	EXPECT_EQ(share.creator->InFlightCount(), static_cast<std::size_t>(0));
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+	EXPECT(share.api.resolves.empty());
+	EXPECT(share.api.events.empty());
+}
+
+TEST(CreateLink, Status200MeansAnIdenticalLinkExistedAndIsSuccessToo)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) { return Respond(200, CreatedBody()); };
+	const Share::Outcome outcome = share.Create(Product());
+	EXPECT(outcome.ok);
+	EXPECT_EQ(outcome.link.url, "https://my-app.strybok.link/Ab3xK9");
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+}
+
+TEST(CreateLink, ArgumentsThatWereNotGivenAreOmittedFromTheBody)
+{
+	Share share;
+	EXPECT(share.Create(Product()).ok);
+	EXPECT_EQ(share.api.creates[0].body, "{\"routePath\":\"/product/42\"}");
+	EXPECT(share.api.creates[0].body.find("null") == std::string::npos);
+
+	CreateLinkParams params = Product();
+	params.title = "Only a title";
+	EXPECT(share.Create(params).ok);
+	EXPECT_EQ(share.api.creates[1].body, "{\"routePath\":\"/product/42\",\"title\":\"Only a title\"}");
+
+	params = Product();
+	params.payloadJson = "  {\"a\":[1,{\"b\":null}]}\n";
+	EXPECT(share.Create(params).ok);
+	EXPECT_EQ(share.api.creates[2].body, "{\"routePath\":\"/product/42\",\"payload\":{\"a\":[1,{\"b\":null}]}}");
+
+	params = Product();
+	params.payloadJson = "{}";
+	params.imageUrl = "https://cdn.example.com/a.png";
+	EXPECT(share.Create(params).ok);
+	EXPECT_EQ(share.api.creates[3].body,
+		"{\"routePath\":\"/product/42\",\"payload\":{},\"imageUrl\":\"https://cdn.example.com/a.png\"}");
+}
+
+TEST(CreateLink, TextIsEscapedInTheBody)
+{
+	Share share;
+	CreateLinkParams params;
+	params.routePath = "/say/\"hi\"\\there";
+	params.title = "line1\nline2\ttab";
+	params.description = std::string("ctl\x01", 4);
+	EXPECT(share.Create(params).ok);
+	json::Value body;
+	EXPECT(json::Parse(share.api.creates[0].body, body));
+	EXPECT_EQ(StringMember(body, "routePath"), "/say/\"hi\"\\there");
+	EXPECT_EQ(StringMember(body, "title"), "line1\nline2\ttab");
+	EXPECT_EQ(StringMember(body, "description"), std::string("ctl\x01", 4));
+}
+
+TEST(CreateLink, KeepsAPathPrefixOfTheApiBaseUrl)
+{
+	ShareOptions options;
+	options.apiBaseUrl = "https://example.com/strybok/";
+	Share share(options);
+	EXPECT(share.Create(Product()).ok);
+	EXPECT_EQ(share.api.creates[0].url, "https://example.com/strybok/v1/public/links");
+	EXPECT_EQ(BuildLinksEndpoint("https://api.strybok.com"), "https://api.strybok.com/v1/public/links");
+}
+
+TEST(CreateLink, WithoutAClientKeyItFailsAsUnauthorizedWithoutANetworkCall)
+{
+	const std::vector<std::string> keys = {"", "   ", "\t\n", "pk_with space", "pk_line\nbreak", "pk_\xC3\xA9"};
+	for (const std::string& key : keys)
+	{
+		ShareOptions options;
+		options.clientKey = key;
+		Share share(options);
+		const Share::Outcome outcome = share.Create(FullProduct());
+		EXPECT(outcome.accepted);
+		EXPECT_EQ(outcome.calls, 1);
+		EXPECT(outcome.synchronous);
+		EXPECT(!outcome.ok);
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Unauthorized);
+		EXPECT_EQ(outcome.error.statusCode, 0);
+		EXPECT(share.api.creates.empty());
+		EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+	}
+	EXPECT_EQ(NormalizeClientKey("  pk_abc \n"), "pk_abc");
+}
+
+TEST(CreateLink, TheMissingKeyIsReportedBeforeABadRoute)
+{
+	ShareOptions options;
+	options.clientKey = "";
+	Share share(options);
+	CreateLinkParams params;
+	params.routePath = "no-slash";
+	EXPECT_EQ(share.Create(params).error.kind, ErrorKind::Unauthorized);
+}
+
+TEST(CreateLink, ABadRoutePathFailsAsValidationWithoutANetworkCall)
+{
+	const std::vector<std::string> routes = {
+		"", "product/42", "//evil.example.com/x", "//", "https://evil.example.com/x", " /product",
+		"/" + std::string(512, 'a'),
+	};
+	for (const std::string& route : routes)
+	{
+		Share share;
+		CreateLinkParams params = FullProduct();
+		params.routePath = route;
+		const Share::Outcome outcome = share.Create(params);
+		EXPECT_MSG(outcome.accepted && outcome.calls == 1 && outcome.synchronous && !outcome.ok, route);
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Validation);
+		EXPECT_EQ(outcome.error.statusCode, 0);
+		EXPECT(!outcome.error.message.empty());
+		EXPECT(outcome.error.issues.empty());
+		EXPECT(share.api.creates.empty());
+		EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+	}
+}
+
+TEST(CreateLink, RoutePathLengthIsCountedInCharactersUpTo512)
+{
+	Share share;
+	CreateLinkParams params;
+	params.routePath = "/" + std::string(511, 'a');
+	EXPECT(share.Create(params).ok);
+
+	params.routePath = "/";
+	EXPECT(share.Create(params).ok);
+
+	// 511 two-byte characters are 1023 bytes but 512 characters with the slash.
+	std::string accented = "/";
+	for (int index = 0; index < 511; ++index)
+	{
+		accented += "\xC3\xA9";
+	}
+	params.routePath = accented;
+	EXPECT(share.Create(params).ok);
+	params.routePath = accented + "\xC3\xA9";
+	EXPECT_EQ(share.Create(params).error.kind, ErrorKind::Validation);
+
+	// A character outside the basic plane counts as two, like on the server.
+	std::string astral = "/" + std::string(509, 'a') + "\xF0\x9F\x98\x80";
+	params.routePath = astral;
+	EXPECT(share.Create(params).ok);
+	params.routePath = astral + "a";
+	EXPECT_EQ(share.Create(params).error.kind, ErrorKind::Validation);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(4));
+}
+
+TEST(CreateLink, APayloadThatIsNotAJsonObjectFailsAsValidationWithoutANetworkCall)
+{
+	const std::vector<std::string> payloads = {
+		"[1,2]", "42", "\"text\"", "true", "null", "{\"a\":", "{'a':1}", "{\"a\":1} trailing", " ",
+		"{\"note\":\"" + kSecretMarker + "\"",
+	};
+	for (const std::string& payload : payloads)
+	{
+		Share share;
+		CreateLinkParams params = Product();
+		params.payloadJson = payload;
+		const Share::Outcome outcome = share.Create(params);
+		EXPECT_MSG(outcome.accepted && outcome.calls == 1 && outcome.synchronous && !outcome.ok, payload);
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Validation);
+		EXPECT_EQ(outcome.error.message, "payload must be a JSON object");
+		EXPECT(!Mentions(outcome.error, kSecretMarker));
+		EXPECT(share.api.creates.empty());
+	}
+}
+
+TEST(CreateLink, AMalformedSuccessBodyIsAServerErrorWithTheStatusAndIsNotRetried)
+{
+	const std::vector<std::string> bodies = {
+		"",
+		"not json",
+		"[]",
+		"\"https://my-app.strybok.link/Ab3xK9\"",
+		"{}",
+		"{\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"slug\":\"Ab3xK9\"}",
+		"{\"linkId\":9,\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"https://my-app.strybok.link/Ab3xK9\",\"slug\":null,\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"http://my-app.strybok.link/Ab3xK9\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"myapp://Ab3xK9\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":\"\",\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+		"{\"linkId\":\"link_9\",\"url\":[\"https://x\"],\"slug\":\"Ab3xK9\",\"routePath\":\"/product/42\"}",
+	};
+	for (const int status : {200, 201})
+	{
+		for (const std::string& body : bodies)
+		{
+			Share share;
+			share.api.onCreate = [status, body](const HttpRequest&) { return Respond(status, body); };
+			const Share::Outcome outcome = share.Create(Product());
+			EXPECT_MSG(outcome.calls == 1 && !outcome.ok, body);
+			EXPECT_EQ(outcome.error.kind, ErrorKind::Server);
+			EXPECT_EQ(outcome.error.statusCode, status);
+			EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+		}
+	}
+}
+
+TEST(CreateLink, TheCreatedUrlIsNotCheckedAgainstAllowedHosts)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) {
+		return Respond(201, "{\"linkId\":\"l\",\"url\":\"https://links.custom-domain.example/Zz9\",\"slug\":\"Zz9\","
+			"\"routePath\":\"/product/42\",\"extra\":true}");
+	};
+	const Share::Outcome outcome = share.Create(Product());
+	EXPECT(outcome.ok);
+	EXPECT_EQ(outcome.link.url, "https://links.custom-domain.example/Zz9");
+}
+
+TEST(CreateLink, Status401IsUnauthorizedAndIsNotRetried)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) {
+		return Respond(401, "{\"error\":{\"code\":\"UNAUTHENTICATED\",\"message\":\"Authentication required\",\"details\":{}}}");
+	};
+	const Share::Outcome outcome = share.Create(FullProduct());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT(!outcome.ok);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Unauthorized);
+	EXPECT_EQ(outcome.error.statusCode, 401);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+}
+
+TEST(CreateLink, Status403IsRouteNotAllowedWithTheRouteAndIsNotRetried)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) {
+		return Respond(403, "{\"error\":{\"code\":\"ROUTE_NOT_ALLOWED\",\"message\":\"Route not allowed\",\"details\":{}}}");
+	};
+	const Share::Outcome outcome = share.Create(FullProduct());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::RouteNotAllowed);
+	EXPECT_EQ(outcome.error.routePath, "/product/42");
+	EXPECT_EQ(outcome.error.statusCode, 403);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+}
+
+TEST(CreateLink, Status429IsRateLimitedWithRetryAfterAndIsNeverRetried)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) {
+		Reply reply = Respond(429, "{\"error\":{\"code\":\"RATE_LIMITED\",\"message\":\"Too many\",\"details\":{\"period\":\"day\"}}}");
+		reply.retryAfter = "60";
+		return reply;
+	};
+	Share::Outcome outcome = share.Create(FullProduct());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::RateLimited);
+	EXPECT_EQ(outcome.error.retryAfterSeconds, static_cast<std::int64_t>(60));
+	EXPECT_EQ(outcome.error.statusCode, 429);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+
+	share.api.onCreate = [](const HttpRequest&) { return Respond(429); };
+	outcome = share.Create(Product());
+	EXPECT_EQ(outcome.error.kind, ErrorKind::RateLimited);
+	EXPECT_EQ(outcome.error.retryAfterSeconds, static_cast<std::int64_t>(-1));
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(2));
+}
+
+TEST(CreateLink, RetryAfterIsReadAsWholeSeconds)
+{
+	EXPECT_EQ(ParseRetryAfterSeconds("60"), static_cast<std::int64_t>(60));
+	EXPECT_EQ(ParseRetryAfterSeconds(" 86400 "), static_cast<std::int64_t>(86400));
+	EXPECT_EQ(ParseRetryAfterSeconds("0"), static_cast<std::int64_t>(0));
+	EXPECT_EQ(ParseRetryAfterSeconds(""), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("   "), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("-5"), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("1.5"), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("soon"), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT"), static_cast<std::int64_t>(-1));
+	EXPECT_EQ(ParseRetryAfterSeconds("99999999999999999999999999"), static_cast<std::int64_t>(2147483647));
+}
+
+TEST(CreateLink, Status400And413And422AreValidationWithTheServersMessageAndIssues)
+{
+	for (const int status : {400, 413, 422})
+	{
+		Share share;
+		share.api.onCreate = [status](const HttpRequest&) {
+			return Respond(status,
+				"{\"error\":{\"code\":\"VALIDATION_ERROR\",\"message\":\"The request is invalid\",\"details\":{\"issues\":["
+				"{\"path\":\"title\",\"message\":\"Too long\"},{\"path\":\"\",\"message\":\"Unrecognized key\"},"
+				"\"junk\",{\"path\":7}]}}}");
+		};
+		const Share::Outcome outcome = share.Create(FullProduct());
+		EXPECT_EQ(outcome.calls, 1);
+		EXPECT(!outcome.ok);
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Validation);
+		EXPECT_EQ(outcome.error.statusCode, status);
+		EXPECT_EQ(outcome.error.message, "The request is invalid");
+		EXPECT_EQ(outcome.error.issues.size(), static_cast<std::size_t>(2));
+		if (outcome.error.issues.size() == 2)
+		{
+			EXPECT_EQ(outcome.error.issues[0].path, "title");
+			EXPECT_EQ(outcome.error.issues[0].message, "Too long");
+			EXPECT_EQ(outcome.error.issues[1].path, "");
+			EXPECT_EQ(outcome.error.issues[1].message, "Unrecognized key");
+		}
+		EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+	}
+}
+
+TEST(CreateLink, AValidationAnswerWithoutAReadableBodyStillIsValidation)
+{
+	const std::vector<std::string> bodies = {"", "<html>", "[]", "{\"error\":\"nope\"}", "{\"error\":{\"message\":7,\"details\":[]}}"};
+	for (const std::string& body : bodies)
+	{
+		Share share;
+		share.api.onCreate = [body](const HttpRequest&) { return Respond(413, body); };
+		const Share::Outcome outcome = share.Create(Product());
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Validation);
+		EXPECT_EQ(outcome.error.statusCode, 413);
+		EXPECT(!outcome.error.message.empty());
+		EXPECT(outcome.error.issues.empty());
+	}
+}
+
+TEST(CreateLink, OtherClientErrorsAndUnexpectedStatusesAreServerErrorsAndAreNotRetried)
+{
+	for (const int status : {402, 404, 405, 409, 418, 202, 204, 301, 304})
+	{
+		Share share;
+		share.api.onCreate = [status](const HttpRequest&) { return Respond(status, CreatedBody()); };
+		const Share::Outcome outcome = share.Create(Product());
+		EXPECT_EQ(outcome.calls, 1);
+		EXPECT(!outcome.ok);
+		EXPECT_EQ(outcome.error.kind, ErrorKind::Server);
+		EXPECT_EQ(outcome.error.statusCode, status);
+		EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+	}
+}
+
+TEST(CreateLink, ServerErrorsAreRetriedWithADoublingPauseAndTheSameBody)
+{
+	ShareOptions options;
+	options.retryDelayMs = 400;
+	options.timeoutMs = 5000;
+	Share share(options);
+	int calls = 0;
+	share.api.onCreate = [&calls](const HttpRequest&) {
+		++calls;
+		return calls < 3 ? Respond(503, "unavailable") : Respond(201, CreatedBody());
+	};
+	const Share::Outcome outcome = share.Create(FullProduct(), 10000);
+	EXPECT(outcome.ok);
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(calls, 3);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(3));
+
+	std::vector<std::int64_t> pauses;
+	for (const std::int64_t delay : share.loop.scheduledDelays)
+	{
+		if (delay != 5000 && delay != 0)
+		{
+			pauses.push_back(delay);
+		}
+	}
+	EXPECT_EQ(pauses.size(), static_cast<std::size_t>(2));
+	if (pauses.size() == 2)
+	{
+		EXPECT_EQ(pauses[0], static_cast<std::int64_t>(400));
+		EXPECT_EQ(pauses[1], static_cast<std::int64_t>(800));
+	}
+
+	for (const HttpRequest& request : share.api.creates)
+	{
+		EXPECT_EQ(request.body, share.api.creates[0].body);
+		EXPECT_EQ(request.url, share.api.creates[0].url);
+		EXPECT_EQ(request.method, "POST");
+		EXPECT(request.headers == share.api.creates[0].headers);
+	}
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+}
+
+TEST(CreateLink, AServerErrorAfterAllRetriesReportsTheLastStatus)
+{
+	Share share;
+	int calls = 0;
+	share.api.onCreate = [&calls](const HttpRequest&) {
+		++calls;
+		return Respond(calls < 3 ? 500 : 502);
+	};
+	const Share::Outcome outcome = share.Create(Product());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Server);
+	EXPECT_EQ(outcome.error.statusCode, 502);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(3));
+}
+
+TEST(CreateLink, TransportFailuresAreRetriedAndThenReportedAsNetwork)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) { return NetworkError(); };
+	Share::Outcome outcome = share.Create(FullProduct());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT(!outcome.ok);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Network);
+	EXPECT_EQ(outcome.error.statusCode, 0);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(3));
+	EXPECT_EQ(share.api.creates[2].body, share.api.creates[0].body);
+
+	// A retry after a lost response gets the existing link back (200).
+	int calls = 0;
+	share.api.onCreate = [&calls](const HttpRequest&) {
+		++calls;
+		return calls == 1 ? NetworkError() : Respond(200, CreatedBody());
+	};
+	outcome = share.Create(Product());
+	EXPECT(outcome.ok);
+	EXPECT_EQ(calls, 2);
+}
+
+TEST(CreateLink, NoAnswerInTimeIsRetriedAndThenReportedAsTimeout)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) { return Hang(); };
+	const Share::Outcome outcome = share.Create(FullProduct());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT(!outcome.ok);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Timeout);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(3));
+	EXPECT_EQ(share.api.creates[1].body, share.api.creates[0].body);
+	EXPECT_EQ(share.api.creates[2].body, share.api.creates[0].body);
+	// Every attempt that was given up on is cancelled.
+	EXPECT(share.api.cancelled == share.api.createIds);
+
+	// A late answer to an abandoned attempt changes nothing.
+	EXPECT(share.api.Complete(share.api.createIds[0], Respond(201, CreatedBody())));
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+}
+
+TEST(CreateLink, TheTimeoutAppliesToEachAttempt)
+{
+	ShareOptions options;
+	options.maxRetries = 1;
+	options.timeoutMs = 100;
+	options.retryDelayMs = 10;
+	Share share(options);
+	share.api.onCreate = [](const HttpRequest&) { return Hang(); };
+	int calls = 0;
+	LinkError last;
+	share.creator->Create(Product(), [&calls, &last](const CreatedLink*, const LinkError* error) {
+		++calls;
+		if (error != nullptr)
+		{
+			last = *error;
+		}
+	});
+	share.loop.Advance(99);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+	share.loop.Advance(1 + 10);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(2));
+	EXPECT_EQ(calls, 0);
+	share.loop.Advance(99);
+	EXPECT_EQ(calls, 0);
+	share.loop.Advance(1);
+	EXPECT_EQ(calls, 1);
+	EXPECT_EQ(last.kind, ErrorKind::Timeout);
+}
+
+TEST(CreateLink, ZeroRetriesMeansASingleAttempt)
+{
+	ShareOptions options;
+	options.maxRetries = 0;
+	Share share(options);
+	share.api.onCreate = [](const HttpRequest&) { return Respond(503); };
+	const Share::Outcome outcome = share.Create(Product());
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Server);
+	EXPECT_EQ(outcome.error.statusCode, 503);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+}
+
+TEST(CreateLink, ErrorsNeverContainTheClientKeyOrThePayload)
+{
+	struct Case
+	{
+		std::function<Reply(const HttpRequest&)> reply;
+		ErrorKind kind;
+	};
+	const std::vector<Case> cases = {
+		{[](const HttpRequest&) { return Respond(401); }, ErrorKind::Unauthorized},
+		{[](const HttpRequest&) { return Respond(403); }, ErrorKind::RouteNotAllowed},
+		{[](const HttpRequest&) { return Respond(429); }, ErrorKind::RateLimited},
+		{[](const HttpRequest&) { return Respond(422, "{\"error\":{\"message\":\"The request is invalid\"}}"); }, ErrorKind::Validation},
+		{[](const HttpRequest&) { return Respond(404); }, ErrorKind::Server},
+		{[](const HttpRequest&) { return Respond(500); }, ErrorKind::Server},
+		{[](const HttpRequest&) { return Respond(201, "{}"); }, ErrorKind::Server},
+		{[](const HttpRequest&) { return NetworkError(); }, ErrorKind::Network},
+		{[](const HttpRequest&) { return Hang(); }, ErrorKind::Timeout},
+	};
+	for (const Case& entry : cases)
+	{
+		Share share;
+		share.api.onCreate = entry.reply;
+		const Share::Outcome outcome = share.Create(FullProduct());
+		EXPECT_EQ(outcome.calls, 1);
+		EXPECT_EQ(outcome.error.kind, entry.kind);
+		EXPECT(!Mentions(outcome.error, kClientKey));
+		EXPECT(!Mentions(outcome.error, "pk_"));
+		EXPECT(!Mentions(outcome.error, kSecretMarker));
+		EXPECT(!Mentions(outcome.error, "productId"));
+		EXPECT(outcome.error.url.empty());
+	}
+
+	// Rejected before sending: a bad route next to a payload, and a bad payload.
+	Share share;
+	CreateLinkParams params = FullProduct();
+	params.routePath = "nope";
+	Share::Outcome outcome = share.Create(params);
+	EXPECT(!Mentions(outcome.error, kClientKey));
+	EXPECT(!Mentions(outcome.error, kSecretMarker));
+	params = FullProduct();
+	params.payloadJson = "[\"" + kSecretMarker + "\"]";
+	outcome = share.Create(params);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Validation);
+	EXPECT(!Mentions(outcome.error, kSecretMarker));
+}
+
+TEST(CreateLink, AnAnswerInsideSendIsHandled)
+{
+	Share share;
+	share.api.synchronous = true;
+	Share::Outcome outcome = share.Create(Product());
+	EXPECT(outcome.ok);
+	EXPECT(outcome.synchronous);
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+
+	share.api.onCreate = [](const HttpRequest&) { return Respond(500); };
+	outcome = share.Create(Product());
+	EXPECT_EQ(outcome.calls, 1);
+	EXPECT_EQ(outcome.error.kind, ErrorKind::Server);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(4));
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+}
+
+TEST(CreateLink, SeveralCallsRunIndependently)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest& request) {
+		return request.body.find("/slow") != std::string::npos ? Hang() : Respond(201, CreatedBody("/fast"));
+	};
+	int slowCalls = 0;
+	int fastCalls = 0;
+	CreateLinkParams slow;
+	slow.routePath = "/slow";
+	CreateLinkParams fast;
+	fast.routePath = "/fast";
+	share.creator->Create(slow, [&slowCalls](const CreatedLink*, const LinkError*) { ++slowCalls; });
+	share.creator->Create(fast, [&fastCalls](const CreatedLink* link, const LinkError*) {
+		fastCalls += link != nullptr ? 1 : 100;
+	});
+	EXPECT_EQ(share.creator->InFlightCount(), static_cast<std::size_t>(2));
+	share.loop.Settle();
+	EXPECT_EQ(fastCalls, 1);
+	EXPECT_EQ(slowCalls, 0);
+	EXPECT_EQ(share.creator->InFlightCount(), static_cast<std::size_t>(1));
+	share.loop.Advance(10000);
+	EXPECT_EQ(slowCalls, 1);
+	EXPECT_EQ(share.creator->InFlightCount(), static_cast<std::size_t>(0));
+}
+
+TEST(CreateLink, WorksWithoutAnEngineAndWhileOneIsNeitherStartedNorListening)
+{
+	// `Share` has no LinkEngine at all and no allowed hosts.
+	Share share;
+	Config config;
+	config.apiBaseUrl = kApi;
+	config.clientKey = kClientKey;
+	EXPECT(ValidateCreateLinkConfig(config).empty());
+	EXPECT(!ValidateConfig(config).empty()); // the receiving side does need allowedHosts
+	config.apiBaseUrl = "api.strybok.com";
+	EXPECT(!ValidateCreateLinkConfig(config).empty());
+	EXPECT(share.Create(Product()).ok);
+
+	// Next to an engine that was never started: both work on their own.
+	Bridge bridge;
+	Config shareConfig;
+	shareConfig.apiBaseUrl = kApi;
+	shareConfig.clientKey = kClientKey;
+	LinkCreator creator(shareConfig, bridge.api, bridge.loop);
+	bool created = false;
+	creator.Create(Product(), [&created](const CreatedLink* link, const LinkError*) { created = link != nullptr; });
+	bridge.loop.Settle();
+	EXPECT(created);
+	EXPECT(!bridge.sdk->IsStarted());
+	EXPECT(bridge.api.resolves.empty());
+	EXPECT(bridge.api.events.empty());
+	EXPECT(bridge.errors.empty());
+}
+
+TEST(CreateLink, IsNeverOnTheStartPathAndItsErrorsDoNotReachOnError)
+{
+	Bridge bridge;
+	bridge.Listen();
+	EXPECT(bridge.Initialize(kInvite));
+	bridge.sdk->HandleUrl("https://my-app.strybok.link/second");
+	bridge.loop.Advance(10000);
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(2));
+	EXPECT(bridge.api.creates.empty()); // starting, resolving and delivering never create links
+
+	Config config;
+	config.apiBaseUrl = kApi;
+	config.clientKey = kClientKey;
+	config.maxRetries = 0;
+	LinkCreator creator(config, bridge.api, bridge.loop);
+	bridge.api.onCreate = [](const HttpRequest&) { return Respond(401); };
+	int failures = 0;
+	creator.Create(Product(), [&failures](const CreatedLink*, const LinkError* error) {
+		failures += error != nullptr ? 1 : 0;
+	});
+	bridge.loop.Settle();
+	EXPECT_EQ(failures, 1);
+	EXPECT(bridge.errors.empty());
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(2));
+
+	// A hanging create does not hold up a link that arrives meanwhile.
+	bridge.api.onCreate = [](const HttpRequest&) { return Hang(); };
+	creator.Create(Product(), nullptr);
+	bridge.loop.Advance(5000);
+	bridge.sdk->HandleUrl("https://my-app.strybok.link/third");
+	bridge.loop.Settle();
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(3));
+}
+
+TEST(CreateLink, StopDropsCallbacksCancelsRequestsAndRejectsFurtherUse)
+{
+	Share share;
+	share.api.onCreate = [](const HttpRequest&) { return Hang(); };
+	int calls = 0;
+	EXPECT(share.creator->Create(Product(), [&calls](const CreatedLink*, const LinkError*) { ++calls; }));
+	share.loop.Advance(10);
+	share.creator->Stop();
+	EXPECT(share.creator->IsStopped());
+	EXPECT_EQ(share.api.cancelled.size(), static_cast<std::size_t>(1));
+	EXPECT_EQ(share.loop.TaskCount(), static_cast<std::size_t>(0));
+	EXPECT(share.api.Complete(share.api.createIds[0], Respond(201, CreatedBody())));
+	share.loop.Advance(10000);
+	EXPECT_EQ(calls, 0);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+
+	EXPECT(!share.creator->Create(Product(), [&calls](const CreatedLink*, const LinkError*) { ++calls; }));
+	EXPECT_EQ(calls, 0);
+	EXPECT_EQ(share.api.creates.size(), static_cast<std::size_t>(1));
+	share.creator->Stop(); // harmless
+}
+
+TEST(CreateLink, DestroyingTheCreatorFromInsideItsCallbackIsSafe)
+{
+	Share share;
+	int calls = 0;
+	share.creator->Create(Product(), [&calls, &share](const CreatedLink*, const LinkError*) {
+		++calls;
+		share.creator.reset();
+	});
+	share.loop.Advance(10000);
+	EXPECT_EQ(calls, 1);
+	EXPECT(share.creator == nullptr);
+
+	// Also when the callback runs before `Create` returns, and while a retry pause is pending.
+	Share early;
+	early.api.synchronous = true;
+	early.creator->Create(Product(), [&calls, &early](const CreatedLink*, const LinkError*) {
+		++calls;
+		early.creator.reset();
+	});
+	EXPECT_EQ(calls, 2);
+
+	ShareOptions options;
+	options.clientKey = "";
+	Share keyless(options);
+	keyless.creator->Create(Product(), [&calls, &keyless](const CreatedLink*, const LinkError*) {
+		++calls;
+		keyless.creator.reset();
+	});
+	EXPECT_EQ(calls, 3);
+
+	Share retrying;
+	retrying.api.onCreate = [](const HttpRequest&) { return Respond(500); };
+	retrying.creator->Create(Product(), nullptr);
+	retrying.loop.Settle();
+	retrying.creator.reset();
+	retrying.loop.Advance(10000);
+	EXPECT_EQ(retrying.loop.TaskCount(), static_cast<std::size_t>(0));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -105,6 +105,11 @@ bool UStrybokSubsystem::Configure(const FStrybokConfig& Config)
 
 	Runtime = NewRuntime;
 
+	// CreateLink follows the new options from its next call on.
+	LastConfig = Config;
+	bHasLastConfig = true;
+	ResetCreateRuntime();
+
 	// URLs that native code (or HandleUrl) collected so far. The oldest one is the launch link,
 	// but only for the first configuration in this process.
 	const TArray<FString> Buffered = FStrybokPlatformLinks::Drain();
@@ -246,6 +251,114 @@ void UStrybokSubsystem::Shutdown()
 	if (Previous.IsValid() && Previous->Engine.IsValid())
 	{
 		Previous->Engine->Stop();
+	}
+	ResetCreateRuntime();
+}
+
+void UStrybokSubsystem::CreateLink(const FStrybokCreateLinkRequest& Request, const FStrybokCreateLinkCompleted& OnComplete)
+{
+	const FStrybokCreateLinkCompleted Callback = OnComplete;
+	CreateLinkNative(Request, [Callback](bool bSuccess, const FStrybokCreatedLink& Link, const FStrybokError& Error)
+	{
+		Callback.ExecuteIfBound(bSuccess, Link, Error);
+	});
+}
+
+void UStrybokSubsystem::CreateLinkNative(
+	const FStrybokCreateLinkRequest& Request,
+	TFunction<void(bool, const FStrybokCreatedLink&, const FStrybokError&)> OnComplete)
+{
+	check(IsInGameThread());
+
+	FString Problem;
+	// Kept alive until the end of this function: the callback may run before Create returns and
+	// may call Shutdown or Configure.
+	const TSharedPtr<FStrybokCreateRuntime> KeepAlive = EnsureCreateRuntime(Problem);
+	if (!KeepAlive.IsValid())
+	{
+		UE_LOG(LogStrybok, Warning, TEXT("Strybok cannot create a link: %s"), *Problem);
+		if (OnComplete)
+		{
+			FStrybokError Error;
+			Error.Kind = EStrybokErrorKind::NotConfigured;
+			Error.Message = Problem;
+			OnComplete(false, FStrybokCreatedLink(), Error);
+		}
+		return;
+	}
+
+	KeepAlive->Creator->Create(
+		StrybokConvert::ToCoreParams(Request),
+		[OnComplete](const strybok::CreatedLink* Link, const strybok::LinkError* Error)
+		{
+			if (Link != nullptr)
+			{
+				UE_LOG(LogStrybok, Verbose, TEXT("Strybok created a link."));
+				if (OnComplete)
+				{
+					OnComplete(true, StrybokConvert::ToCreatedLink(*Link), FStrybokError());
+				}
+			}
+			else if (Error != nullptr)
+			{
+				// Neither the client key nor the payload is part of an error, so this is safe to log.
+				const FStrybokError Converted = StrybokConvert::ToError(*Error);
+				UE_LOG(LogStrybok, Warning, TEXT("Strybok could not create a link: %s (status %d)"), *Converted.Message, Converted.StatusCode);
+				if (OnComplete)
+				{
+					OnComplete(false, FStrybokCreatedLink(), Converted);
+				}
+			}
+		});
+}
+
+TSharedPtr<FStrybokCreateRuntime> UStrybokSubsystem::EnsureCreateRuntime(FString& OutProblem)
+{
+	if (CreateRuntime.IsValid() && CreateRuntime->Creator.IsValid() && !CreateRuntime->Creator->IsStopped())
+	{
+		return CreateRuntime;
+	}
+
+	FStrybokConfig Config;
+	if (bHasLastConfig)
+	{
+		Config = LastConfig;
+	}
+	else
+	{
+		const UStrybokSettings* Settings = GetDefault<UStrybokSettings>();
+		if (Settings == nullptr)
+		{
+			OutProblem = TEXT("Strybok is not configured");
+			return nullptr;
+		}
+		Config = Settings->ToConfig();
+	}
+
+	// Only what creating links needs is checked: no link host is required. A missing client key is
+	// reported by the core as Unauthorized, per call.
+	const strybok::Config CoreConfig = StrybokConvert::ToCoreConfig(Config);
+	const std::string Problem = strybok::ValidateCreateLinkConfig(CoreConfig);
+	if (!Problem.empty())
+	{
+		OutProblem = StrybokConvert::ToFString(Problem);
+		return nullptr;
+	}
+
+	const TSharedRef<FStrybokCreateRuntime> NewRuntime = MakeShared<FStrybokCreateRuntime>();
+	NewRuntime->Creator = MakeUnique<strybok::LinkCreator>(CoreConfig, NewRuntime->Transport, NewRuntime->Scheduler);
+	CreateRuntime = NewRuntime;
+	return CreateRuntime;
+}
+
+void UStrybokSubsystem::ResetCreateRuntime()
+{
+	// Kept alive until the end of this function: we may be inside one of its callbacks.
+	const TSharedPtr<FStrybokCreateRuntime> Previous = CreateRuntime;
+	CreateRuntime.Reset();
+	if (Previous.IsValid() && Previous->Creator.IsValid())
+	{
+		Previous->Creator->Stop();
 	}
 }
 

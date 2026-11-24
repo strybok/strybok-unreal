@@ -43,16 +43,38 @@ enum class ErrorKind
 	Timeout,
 	/** Unexpected status code or body; `statusCode` is set. */
 	Server,
+	/** Creating links only: no client key configured (no network call), or 401. */
+	Unauthorized,
+	/** Creating links only: 403, the route is not covered by the application's route patterns. */
+	RouteNotAllowed,
+	/** Creating links only: 429; `retryAfterSeconds` is set when the server sent `Retry-After`. */
+	RateLimited,
+	/** Creating links only: rejected before sending, or 400 / 413 / 422 from the server. */
+	Validation,
+};
+
+/** One entry of the server's `error.details.issues` for a `Validation` error. */
+struct ValidationIssue
+{
+	/** Which field, e.g. `title` or `payload.a`; may be empty. */
+	std::string path;
+	std::string message;
 };
 
 struct LinkError
 {
 	ErrorKind kind = ErrorKind::Server;
 	std::string message;
-	/** The URL that was being handled. */
+	/** The URL that was being handled; empty for errors of creating a link. */
 	std::string url;
-	/** HTTP status for `Server` and `LinkNotFound` (404); 0 otherwise. */
+	/** HTTP status of the answer when there was one; 0 otherwise. */
 	int statusCode = 0;
+	/** `RouteNotAllowed`: the route that was refused. */
+	std::string routePath;
+	/** `RateLimited`: seconds from the `Retry-After` header; -1 when the server sent none. */
+	std::int64_t retryAfterSeconds = -1;
+	/** `Validation` from the server: its `error.details.issues`, if any. */
+	std::vector<ValidationIssue> issues;
 };
 
 /**
@@ -91,6 +113,34 @@ struct Config
 	std::string platform = "unknown";
 	/** Reported with events, truncated to 32 characters. Empty means `kSdkVersion`. */
 	std::string sdkVersion;
+	/**
+	 * Publishable key `pk_...` of the application. Only needed for creating links; it is not a
+	 * secret. Never put a secret API key (`lb_...`) here.
+	 */
+	std::string clientKey;
+};
+
+/** What `LinkCreator::Create` sends. Only `routePath` is required; an empty string means "not given". */
+struct CreateLinkParams
+{
+	/** In-app route the link opens: starts with `/`, not with `//`, at most 512 characters. */
+	std::string routePath;
+	/** A JSON object as text, e.g. `{"productId":42}`. Empty: no payload. */
+	std::string payloadJson;
+	std::string title;
+	std::string description;
+	/** Preview image; the server requires a public HTTPS URL. */
+	std::string imageUrl;
+};
+
+/** A link made by `LinkCreator::Create`. */
+struct CreatedLink
+{
+	/** What the user shares; always starts with `https://`. */
+	std::string url;
+	std::string slug;
+	std::string routePath;
+	std::string linkId;
 };
 
 struct HttpRequest
@@ -107,6 +157,8 @@ struct HttpResponse
 	bool transportOk = false;
 	int statusCode = 0;
 	std::string body;
+	/** Value of the `Retry-After` response header; empty when the response had none. */
+	std::string retryAfter;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -227,6 +279,50 @@ std::string BuildAppOpenBody(
 	const std::string& linkId,
 	const std::string& platform,
 	const std::string& sdkVersion);
+
+// --- creating links ---
+
+/** Like `ValidateConfig`, but only what creating links needs: `allowedHosts` is not looked at. */
+std::string ValidateCreateLinkConfig(const Config& config);
+
+/** `{apiBaseUrl}/v1/public/links`. */
+std::string BuildLinksEndpoint(const std::string& apiBaseUrl);
+
+/**
+ * `clientKey` without surrounding ASCII whitespace. Empty when it is missing or cannot be sent as
+ * a header value (contains spaces, control or non-ASCII characters): such a key is never valid.
+ */
+std::string NormalizeClientKey(const std::string& clientKey);
+
+/**
+ * The checks made before any network call, and the request body. Returns false and says why in
+ * `outProblem` when `routePath` does not start with `/`, starts with `//` or is longer than 512
+ * characters, or when `payloadJson` is given and is not a JSON object. Fields that were not given
+ * are left out of the body; nothing else is validated here (the server does that).
+ */
+bool BuildCreateLinkBody(const CreateLinkParams& params, std::string& outBody, std::string& outProblem);
+
+/**
+ * Validates a 200 / 201 body: a JSON object with string `linkId`, `slug`, `routePath` and a `url`
+ * string starting with `https://`.
+ */
+bool ParseCreateLinkBody(const std::string& body, CreatedLink& outLink);
+
+/** Whole seconds from a `Retry-After` value; -1 when it is empty or not a plain number of seconds. */
+std::int64_t ParseRetryAfterSeconds(const std::string& value);
+
+struct CreateAttemptResult
+{
+	/** `Deliver` means the link was created (or already existed). */
+	AttemptAction action = AttemptAction::Fail;
+	/** Valid for `Deliver`. */
+	CreatedLink link;
+	/** Valid for `Fail` and `Retry` (the error to report if no attempts are left). */
+	LinkError error;
+};
+
+/** Decides what one HTTP answer to a create-link request means. */
+CreateAttemptResult ClassifyCreateLinkResponse(const std::string& routePath, const HttpResponse& response);
 
 // ---------------------------------------------------------------------------------------------
 // Minimal strict JSON reader (RFC 8259), enough to validate API responses
@@ -365,6 +461,55 @@ public:
 	 * Stops everything. Nothing is delivered afterwards, including links that were still
 	 * resolving; callbacks of unfinished `Resolve`, `Start` and `GetInitialLink` calls are dropped.
 	 */
+	void Stop();
+
+private:
+	class Impl;
+	std::shared_ptr<Impl> impl_;
+};
+
+/**
+ * Creates short links to screens of this app (the contract's `createLink`, the "Share" button).
+ *
+ * Independent of `LinkEngine` on purpose: it is never part of starting, resolving or delivering,
+ * needs no `allowedHosts` and can be used whether or not an engine exists. It only does something
+ * when `Create` is called. Uses `apiBaseUrl`, `clientKey`, `timeoutMs`, `maxRetries` and
+ * `retryDelayMs` of the config.
+ *
+ * The transport and the scheduler must outlive the creator. Same threading rule as `LinkEngine`.
+ * Destroying the creator is the same as `Stop`.
+ */
+class LinkCreator
+{
+public:
+	/** Exactly one of the two pointers is non-null. They are valid only during the call. */
+	using Callback = std::function<void(const CreatedLink* link, const LinkError* error)>;
+
+	LinkCreator(Config config, IHttpTransport& transport, IScheduler& scheduler);
+	~LinkCreator();
+
+	LinkCreator(const LinkCreator&) = delete;
+	LinkCreator& operator=(const LinkCreator&) = delete;
+
+	/**
+	 * Asks the service for a link to `params.routePath`. The callback gets the link or one error:
+	 * `Unauthorized` (no client key: no network call; or 401), `Validation` (bad route or payload:
+	 * no network call; or 400 / 413 / 422), `RouteNotAllowed` (403), `RateLimited` (429), and
+	 * `Network` / `Timeout` / `Server` after the retries. Errors found before sending are reported
+	 * through the callback before `Create` returns. Errors never contain the client key or the
+	 * payload. Returns false, without calling back, when the creator is stopped.
+	 *
+	 * Creation is idempotent on the server (same content, same link), so timeouts, transport
+	 * failures and 5xx are retried with exactly the same body. 4xx, including 429, never are.
+	 */
+	bool Create(const CreateLinkParams& params, Callback callback);
+
+	/** Number of `Create` calls that have not called back yet. */
+	std::size_t InFlightCount() const;
+
+	bool IsStopped() const;
+
+	/** Abandons requests in flight; their callbacks are dropped. `Create` returns false afterwards. */
 	void Stop();
 
 private:

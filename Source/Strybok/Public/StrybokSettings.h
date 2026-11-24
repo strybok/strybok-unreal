@@ -70,6 +70,14 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Analytics")
 	bool bReportAppOpens = true;
 
+	/**
+	 * Publishable client key of the application ("pk_..."), from the dashboard ("Links from the
+	 * app"). Only needed for CreateLink. It is safe to ship in the game: it can only create links
+	 * for the route patterns listed in the dashboard. Never put a secret API key ("lb_...") here.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Link creation")
+	FString ClientKey;
+
 	/** These settings as a config for UStrybokSubsystem::Configure. */
 	FStrybokConfig ToConfig() const;
 };

@@ -18,6 +18,19 @@ void UMyGameInstance::HandleLink(const FStrybokResolvedLink& Link)
 }
 ```
 
+Create a link to share (needs the application's publishable client key `pk_…` in the Project
+Settings, with "Links from the app" switched on and route patterns listed in the dashboard — never
+a secret API key):
+
+```cpp
+FStrybokCreateLinkRequest Request;
+Request.RoutePath = TEXT("/product/42");
+Strybok->CreateLinkNative(Request, [](bool bSuccess, const FStrybokCreatedLink& Link, const FStrybokError& Error)
+{
+	// bSuccess: share Link.Url. Otherwise see Error.Kind.
+});
+```
+
 Full guide (installation, Project Settings, iOS and Android setup, Blueprint, errors,
 troubleshooting, known gaps): [`docs/unreal.md`](./docs/unreal.md).
 
@@ -45,7 +58,7 @@ LinkHost=my-app.strybok.link
 | `Strybok.uplugin`                                 | Plugin descriptor (one runtime module, `Strybok`).                                                |
 | `Source/Strybok/Private/StrybokCore/`             | The contract in portable C++17: standard library only, no Unreal headers, no exceptions, no RTTI. |
 | `Source/Strybok/Public/StrybokSubsystem.h`        | `UStrybokSubsystem` (game instance subsystem): the Blueprint and C++ API.                         |
-| `Source/Strybok/Public/StrybokTypes.h`            | `FStrybokResolvedLink`, `FStrybokError`, `FStrybokConfig`, delegates.                             |
+| `Source/Strybok/Public/StrybokTypes.h`            | `FStrybokResolvedLink`, `FStrybokCreatedLink`, `FStrybokError`, `FStrybokConfig`, delegates.      |
 | `Source/Strybok/Public/StrybokSettings.h`         | `UStrybokSettings` (Project Settings page).                                                       |
 | `Source/Strybok/Public/StrybokBlueprintLibrary.h` | Blueprint helpers: payload field, route segments.                                                 |
 | `Source/Strybok/Private/StrybokRuntime.*`         | Core ↔ engine: `FHttpModule` transport, `FTSTicker` timers, clock, string conversion.             |
@@ -58,7 +71,8 @@ How it fits together: native code only drops URLs into a small thread-safe buffe
 (`FStrybokPlatformLinks`). The subsystem drains it on the game thread once per frame and feeds the
 core (`strybok::LinkEngine`), which owns every rule: which URLs are ours, what is sent to the API,
 retries, response validation, duplicate protection, the queue for links that arrive before a
-listener, and the `app_open` event.
+listener, and the `app_open` event. Creating links is a separate class of the core
+(`strybok::LinkCreator`) with its own transport and timers, so it never depends on receiving them.
 
 ## Tests
 

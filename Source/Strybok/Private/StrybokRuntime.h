@@ -16,6 +16,8 @@ namespace StrybokConvert
 	FString ToFString(const std::string& Value);
 	FStrybokResolvedLink ToLink(const strybok::ResolvedLink& Link);
 	FStrybokError ToError(const strybok::LinkError& Error);
+	FStrybokCreatedLink ToCreatedLink(const strybok::CreatedLink& Link);
+	strybok::CreateLinkParams ToCoreParams(const FStrybokCreateLinkRequest& Request);
 	strybok::Config ToCoreConfig(const FStrybokConfig& Config);
 }
 
@@ -92,4 +94,16 @@ struct FStrybokRuntime
 	FStrybokTickerScheduler Scheduler;
 	FStrybokClock Clock;
 	TUniquePtr<strybok::LinkEngine> Engine;
+};
+
+/**
+ * What CreateLink needs: its own transport and timers, apart from the runtime above, so creating
+ * links never depends on (or disturbs) receiving them. The creator is declared last so it is
+ * destroyed first.
+ */
+struct FStrybokCreateRuntime
+{
+	FStrybokHttpTransport Transport;
+	FStrybokTickerScheduler Scheduler;
+	TUniquePtr<strybok::LinkCreator> Creator;
 };

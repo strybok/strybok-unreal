@@ -7,6 +7,7 @@
 #include "StrybokSubsystem.generated.h"
 
 struct FStrybokRuntime;
+struct FStrybokCreateRuntime;
 
 /**
  * Entry point of the Strybok SDK.
@@ -125,8 +126,38 @@ public:
 	bool IsStrybokUrl(const FString& Url) const;
 
 	/**
-	 * Stops the SDK: nothing is delivered afterwards, including links that were still resolving.
-	 * Happens automatically when the game instance shuts down. Configure starts it again.
+	 * Asks the service for a short link to a screen of this game (a "Share" button). OnComplete
+	 * gets the link (share Link.Url) or an error; errors of CreateLink never fire OnLinkError.
+	 *
+	 * Needs the publishable Client Key ("pk_...") from the dashboard, where creating links from the
+	 * app must be switched on and the allowed route patterns listed. Never use a secret API key.
+	 *
+	 * It only runs when you call it and has nothing to do with receiving links: it works before
+	 * and without Configure (then with Project Settings > Plugins > Strybok) and needs no link
+	 * host. After a successful Configure it uses that configuration.
+	 *
+	 * Errors: Unauthorized (no key set: no network call; or the key was refused), Validation (bad
+	 * route or payload: no network call; or rejected by the service, see Issues), RouteNotAllowed,
+	 * RateLimited (see RetryAfterSeconds), Network / Timeout / Server after the retries, and
+	 * NotConfigured when the API base URL is unusable. RateLimited, Network, Timeout and Server
+	 * are temporary: let the player try again later. The others need a change in the game or in
+	 * the dashboard.
+	 *
+	 * Asking again for the same content returns the same link. Shutdown, a new Configure and the
+	 * end of the game instance abandon requests in flight: their OnComplete is not called.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Strybok")
+	void CreateLink(const FStrybokCreateLinkRequest& Request, const FStrybokCreateLinkCompleted& OnComplete);
+
+	/** CreateLink for C++ lambdas. Link is valid when bSuccess, otherwise Error is. */
+	void CreateLinkNative(
+		const FStrybokCreateLinkRequest& Request,
+		TFunction<void(bool /*bSuccess*/, const FStrybokCreatedLink& /*Link*/, const FStrybokError& /*Error*/)> OnComplete);
+
+	/**
+	 * Stops the SDK: nothing is delivered afterwards, including links that were still resolving,
+	 * and CreateLink requests in flight are abandoned. Happens automatically when the game
+	 * instance shuts down. Configure starts it again.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Strybok")
 	void Shutdown();
@@ -137,8 +168,19 @@ private:
 	void DeliverLink(const FStrybokResolvedLink& Link);
 	void DeliverError(const FStrybokError& Error);
 
+	/** The runtime of CreateLink, made on first use. Null with a problem text when the options are unusable. */
+	TSharedPtr<FStrybokCreateRuntime> EnsureCreateRuntime(FString& OutProblem);
+	void ResetCreateRuntime();
+
 	/** Transport, timers and the engine-independent core. Null while not configured. */
 	TSharedPtr<FStrybokRuntime> Runtime;
+
+	/** Transport, timers and the core's link creator. Null until CreateLink is first used. */
+	TSharedPtr<FStrybokCreateRuntime> CreateRuntime;
+
+	/** The options of the last successful Configure; CreateLink uses the project settings without one. */
+	FStrybokConfig LastConfig;
+	bool bHasLastConfig = false;
 
 	FStrybokLinkReceivedNative LinkReceivedNative;
 	FStrybokLinkFailedNative LinkErrorNative;

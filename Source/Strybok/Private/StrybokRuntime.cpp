@@ -46,6 +46,18 @@ FStrybokError StrybokConvert::ToError(const strybok::LinkError& Error)
 	case strybok::ErrorKind::Timeout:
 		Result.Kind = EStrybokErrorKind::Timeout;
 		break;
+	case strybok::ErrorKind::Unauthorized:
+		Result.Kind = EStrybokErrorKind::Unauthorized;
+		break;
+	case strybok::ErrorKind::RouteNotAllowed:
+		Result.Kind = EStrybokErrorKind::RouteNotAllowed;
+		break;
+	case strybok::ErrorKind::RateLimited:
+		Result.Kind = EStrybokErrorKind::RateLimited;
+		break;
+	case strybok::ErrorKind::Validation:
+		Result.Kind = EStrybokErrorKind::Validation;
+		break;
 	case strybok::ErrorKind::Server:
 	default:
 		Result.Kind = EStrybokErrorKind::Server;
@@ -54,6 +66,38 @@ FStrybokError StrybokConvert::ToError(const strybok::LinkError& Error)
 	Result.Message = ToFString(Error.message);
 	Result.Url = ToFString(Error.url);
 	Result.StatusCode = Error.statusCode;
+	Result.RoutePath = ToFString(Error.routePath);
+	// The core caps the value at the largest int32.
+	Result.RetryAfterSeconds = Error.retryAfterSeconds < 0 ? -1 : static_cast<int32>(Error.retryAfterSeconds);
+	for (const strybok::ValidationIssue& Issue : Error.issues)
+	{
+		FStrybokValidationIssue Converted;
+		Converted.Path = ToFString(Issue.path);
+		Converted.Message = ToFString(Issue.message);
+		Result.Issues.Add(MoveTemp(Converted));
+	}
+	return Result;
+}
+
+FStrybokCreatedLink StrybokConvert::ToCreatedLink(const strybok::CreatedLink& Link)
+{
+	FStrybokCreatedLink Result;
+	Result.Url = ToFString(Link.url);
+	Result.Slug = ToFString(Link.slug);
+	Result.RoutePath = ToFString(Link.routePath);
+	Result.LinkId = ToFString(Link.linkId);
+	return Result;
+}
+
+strybok::CreateLinkParams StrybokConvert::ToCoreParams(const FStrybokCreateLinkRequest& Request)
+{
+	strybok::CreateLinkParams Result;
+	// The route is sent exactly as given: the core rejects one that does not start with "/".
+	Result.routePath = ToStd(Request.RoutePath);
+	Result.payloadJson = ToStd(Request.PayloadJson.TrimStartAndEnd());
+	Result.title = ToStd(Request.Title);
+	Result.description = ToStd(Request.Description);
+	Result.imageUrl = ToStd(Request.ImageUrl.TrimStartAndEnd());
 	return Result;
 }
 
@@ -78,6 +122,7 @@ strybok::Config StrybokConvert::ToCoreConfig(const FStrybokConfig& Config)
 	Result.platform = "unknown";
 #endif
 	Result.sdkVersion = strybok::kSdkVersion;
+	Result.clientKey = ToStd(Config.ClientKey.TrimStartAndEnd());
 	return Result;
 }
 
@@ -132,6 +177,8 @@ std::uint64_t FStrybokHttpTransport::Send(const strybok::HttpRequest& Request, C
 				Response.transportOk = true;
 				Response.statusCode = static_cast<int>(HttpResponse->GetResponseCode());
 				Response.body = StrybokConvert::ToStd(HttpResponse->GetContentAsString());
+				// Empty when the header is absent. Only used for 429 answers to CreateLink.
+				Response.retryAfter = StrybokConvert::ToStd(HttpResponse->GetHeader(TEXT("Retry-After")));
 			}
 			if (IsInGameThread())
 			{

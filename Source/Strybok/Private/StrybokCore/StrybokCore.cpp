@@ -9,7 +9,7 @@
 namespace strybok
 {
 
-const char* const kSdkVersion = "0.1.0";
+const char* const kSdkVersion = "0.2.0";
 
 IHttpTransport::~IHttpTransport() = default;
 IScheduler::~IScheduler() = default;
@@ -23,6 +23,8 @@ const std::size_t kMaxSlugLength = 64;
 const std::size_t kMaxSdkVersionLength = 32;
 const int kMaxJsonDepth = 64;
 const int kMaxRetriesLimit = 10;
+const std::size_t kMaxRoutePathLength = 512;
+const std::int64_t kMaxRetryAfterSeconds = 2147483647;
 
 bool IsAsciiSpace(char c)
 {
@@ -680,7 +682,7 @@ std::vector<std::string> NormalizeHosts(const std::vector<std::string>& hosts)
 	return result;
 }
 
-std::string ValidateConfig(const Config& config)
+std::string ValidateCreateLinkConfig(const Config& config)
 {
 	const std::string& base = config.apiBaseUrl;
 	const bool https = StartsWithIgnoreCase(base, "https://");
@@ -700,18 +702,6 @@ std::string ValidateConfig(const Config& config)
 			return "apiBaseUrl must not contain a query, a fragment, spaces or control characters";
 		}
 	}
-	const std::vector<std::string> hosts = NormalizeHosts(config.allowedHosts);
-	if (hosts.empty())
-	{
-		return "allowedHosts is empty";
-	}
-	for (const std::string& host : hosts)
-	{
-		if (!IsValidHostName(host))
-		{
-			return "allowedHosts entry is not a plain hostname: " + host;
-		}
-	}
 	if (config.timeoutMs <= 0)
 	{
 		return "timeout must be positive";
@@ -723,6 +713,28 @@ std::string ValidateConfig(const Config& config)
 	if (config.retryDelayMs < 0)
 	{
 		return "retryDelay must not be negative";
+	}
+	return std::string();
+}
+
+std::string ValidateConfig(const Config& config)
+{
+	const std::string common = ValidateCreateLinkConfig(config);
+	if (!common.empty())
+	{
+		return common;
+	}
+	const std::vector<std::string> hosts = NormalizeHosts(config.allowedHosts);
+	if (hosts.empty())
+	{
+		return "allowedHosts is empty";
+	}
+	for (const std::string& host : hosts)
+	{
+		if (!IsValidHostName(host))
+		{
+			return "allowedHosts entry is not a plain hostname: " + host;
+		}
 	}
 	if (config.dedupeWindowMs < 0)
 	{
@@ -916,6 +928,286 @@ std::string BuildAppOpenBody(
 	body += json::Quote(version.substr(0, kMaxSdkVersionLength));
 	body += "}";
 	return body;
+}
+
+// --- creating links ---
+
+std::string BuildLinksEndpoint(const std::string& apiBaseUrl)
+{
+	return TrimTrailingSlashes(apiBaseUrl) + "/v1/public/links";
+}
+
+std::string NormalizeClientKey(const std::string& clientKey)
+{
+	std::size_t begin = 0;
+	std::size_t end = clientKey.size();
+	while (begin < end && IsAsciiSpace(clientKey[begin]))
+	{
+		++begin;
+	}
+	while (end > begin && IsAsciiSpace(clientKey[end - 1]))
+	{
+		--end;
+	}
+	for (std::size_t index = begin; index < end; ++index)
+	{
+		const unsigned char byte = static_cast<unsigned char>(clientKey[index]);
+		if (byte <= 0x20 || byte >= 0x7F)
+		{
+			return std::string(); // cannot be a header value, so it cannot be a working key
+		}
+	}
+	return clientKey.substr(begin, end - begin);
+}
+
+bool BuildCreateLinkBody(const CreateLinkParams& params, std::string& outBody, std::string& outProblem)
+{
+	const std::string& route = params.routePath;
+	if (route.empty() || route[0] != '/')
+	{
+		outProblem = "routePath must start with \"/\"";
+		return false;
+	}
+	if (route.size() > 1 && route[1] == '/')
+	{
+		outProblem = "routePath must not start with \"//\"";
+		return false;
+	}
+	// Characters as the server counts them (UTF-16 code units), from UTF-8 bytes.
+	std::size_t length = 0;
+	for (char c : route)
+	{
+		const unsigned char byte = static_cast<unsigned char>(c);
+		if ((byte & 0xC0u) != 0x80u)
+		{
+			length += byte >= 0xF0u ? 2u : 1u;
+		}
+	}
+	if (length > kMaxRoutePathLength)
+	{
+		outProblem = "routePath must be at most 512 characters";
+		return false;
+	}
+
+	std::string payload;
+	if (!params.payloadJson.empty())
+	{
+		json::Value parsed;
+		if (!json::Parse(params.payloadJson, parsed) || parsed.type != json::Type::Object)
+		{
+			outProblem = "payload must be a JSON object";
+			return false;
+		}
+		payload = params.payloadJson.substr(parsed.begin, parsed.end - parsed.begin);
+	}
+
+	std::string body = "{\"routePath\":";
+	body += json::Quote(route);
+	if (!payload.empty())
+	{
+		body += ",\"payload\":";
+		body += payload;
+	}
+	if (!params.title.empty())
+	{
+		body += ",\"title\":";
+		body += json::Quote(params.title);
+	}
+	if (!params.description.empty())
+	{
+		body += ",\"description\":";
+		body += json::Quote(params.description);
+	}
+	if (!params.imageUrl.empty())
+	{
+		body += ",\"imageUrl\":";
+		body += json::Quote(params.imageUrl);
+	}
+	body += "}";
+	outBody = std::move(body);
+	outProblem.clear();
+	return true;
+}
+
+bool ParseCreateLinkBody(const std::string& body, CreatedLink& outLink)
+{
+	json::Value root;
+	if (!json::Parse(body, root) || root.type != json::Type::Object)
+	{
+		return false;
+	}
+	const json::Value* linkId = root.Find("linkId");
+	const json::Value* slug = root.Find("slug");
+	const json::Value* routePath = root.Find("routePath");
+	const json::Value* url = root.Find("url");
+	if (linkId == nullptr || linkId->type != json::Type::String ||
+		slug == nullptr || slug->type != json::Type::String ||
+		routePath == nullptr || routePath->type != json::Type::String ||
+		url == nullptr || url->type != json::Type::String)
+	{
+		return false;
+	}
+	if (url->text.compare(0, 8, "https://") != 0)
+	{
+		return false;
+	}
+	outLink = CreatedLink();
+	outLink.url = url->text;
+	outLink.slug = slug->text;
+	outLink.routePath = routePath->text;
+	outLink.linkId = linkId->text;
+	return true;
+}
+
+std::int64_t ParseRetryAfterSeconds(const std::string& value)
+{
+	std::size_t begin = 0;
+	std::size_t end = value.size();
+	while (begin < end && IsAsciiSpace(value[begin]))
+	{
+		++begin;
+	}
+	while (end > begin && IsAsciiSpace(value[end - 1]))
+	{
+		--end;
+	}
+	if (begin == end)
+	{
+		return -1;
+	}
+	std::int64_t seconds = 0;
+	for (std::size_t index = begin; index < end; ++index)
+	{
+		if (!IsAsciiDigit(value[index]))
+		{
+			return -1; // an HTTP date or something else; the contract only knows seconds
+		}
+		if (seconds < kMaxRetryAfterSeconds)
+		{
+			seconds = seconds * 10 + (value[index] - '0');
+		}
+		if (seconds > kMaxRetryAfterSeconds)
+		{
+			seconds = kMaxRetryAfterSeconds;
+		}
+	}
+	return seconds;
+}
+
+namespace
+{
+
+/** The server's `error.message` and `error.details.issues`, when the body has them. */
+void ReadServerValidation(const std::string& body, LinkError& error)
+{
+	json::Value root;
+	if (!json::Parse(body, root) || root.type != json::Type::Object)
+	{
+		return;
+	}
+	const json::Value* envelope = root.Find("error");
+	if (envelope == nullptr || envelope->type != json::Type::Object)
+	{
+		return;
+	}
+	const json::Value* message = envelope->Find("message");
+	if (message != nullptr && message->type == json::Type::String && !message->text.empty())
+	{
+		error.message = message->text;
+	}
+	const json::Value* details = envelope->Find("details");
+	const json::Value* issues =
+		details != nullptr && details->type == json::Type::Object ? details->Find("issues") : nullptr;
+	if (issues == nullptr || issues->type != json::Type::Array)
+	{
+		return;
+	}
+	for (const json::Value& item : issues->items)
+	{
+		if (item.type != json::Type::Object)
+		{
+			continue;
+		}
+		const json::Value* path = item.Find("path");
+		const json::Value* text = item.Find("message");
+		ValidationIssue issue;
+		if (path != nullptr && path->type == json::Type::String)
+		{
+			issue.path = path->text;
+		}
+		if (text != nullptr && text->type == json::Type::String)
+		{
+			issue.message = text->text;
+		}
+		if (!issue.path.empty() || !issue.message.empty())
+		{
+			error.issues.push_back(std::move(issue));
+		}
+	}
+}
+
+} // namespace
+
+CreateAttemptResult ClassifyCreateLinkResponse(const std::string& routePath, const HttpResponse& response)
+{
+	CreateAttemptResult result;
+	if (!response.transportOk)
+	{
+		result.action = AttemptAction::Retry;
+		result.error = MakeError(ErrorKind::Network, "Network error", std::string());
+		return result;
+	}
+	const int status = response.statusCode;
+	result.action = AttemptAction::Fail;
+	if (status == 200 || status == 201)
+	{
+		// 200: an identical link already existed. 201: a new one was made. Both are success.
+		if (ParseCreateLinkBody(response.body, result.link))
+		{
+			result.action = AttemptAction::Deliver;
+		}
+		else
+		{
+			result.error = MakeError(ErrorKind::Server, "Malformed create-link response", std::string(), status);
+		}
+		return result;
+	}
+	if (status == 401)
+	{
+		result.error = MakeError(
+			ErrorKind::Unauthorized,
+			"The client key was not accepted, or creating links from the app is switched off",
+			std::string(),
+			status);
+		return result;
+	}
+	if (status == 403)
+	{
+		result.error = MakeError(
+			ErrorKind::RouteNotAllowed,
+			"The route is not covered by the application's route patterns",
+			std::string(),
+			status);
+		result.error.routePath = routePath;
+		return result;
+	}
+	if (status == 429)
+	{
+		result.error = MakeError(ErrorKind::RateLimited, "Too many requests; try again later", std::string(), status);
+		result.error.retryAfterSeconds = ParseRetryAfterSeconds(response.retryAfter);
+		return result;
+	}
+	if (status == 400 || status == 413 || status == 422)
+	{
+		result.error = MakeError(
+			ErrorKind::Validation, "The server rejected the link (status " + IntToString(status) + ")", std::string(), status);
+		ReadServerValidation(response.body, result.error);
+		return result;
+	}
+	// Other client errors will not improve; server errors might.
+	result.action = status >= 500 ? AttemptAction::Retry : AttemptAction::Fail;
+	result.error = MakeError(ErrorKind::Server, "Unexpected status " + IntToString(status), std::string(), status);
+	return result;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1720,6 +2012,302 @@ std::size_t LinkEngine::PendingCount() const
 }
 
 void LinkEngine::Stop()
+{
+	const std::shared_ptr<Impl> keepAlive = impl_;
+	keepAlive->Stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Creating links
+// ---------------------------------------------------------------------------------------------
+
+class LinkCreator::Impl : public std::enable_shared_from_this<LinkCreator::Impl>
+{
+public:
+	Impl(Config config, IHttpTransport& transport, IScheduler& scheduler)
+		: config_(std::move(config))
+		, clientKey_(NormalizeClientKey(config_.clientKey))
+		, endpoint_(BuildLinksEndpoint(config_.apiBaseUrl))
+		, transport_(transport)
+		, scheduler_(scheduler)
+	{
+		if (config_.maxRetries < 0)
+		{
+			config_.maxRetries = 0;
+		}
+		if (config_.maxRetries > kMaxRetriesLimit)
+		{
+			config_.maxRetries = kMaxRetriesLimit;
+		}
+		if (config_.timeoutMs < 1)
+		{
+			config_.timeoutMs = 1;
+		}
+	}
+
+	bool IsStopped() const { return stopped_; }
+	std::size_t InFlightCount() const { return ops_.size(); }
+
+	bool Create(const CreateLinkParams& params, Callback callback)
+	{
+		if (stopped_)
+		{
+			return false;
+		}
+		// The checks of the contract, in its order, before any network call.
+		if (clientKey_.empty())
+		{
+			if (callback)
+			{
+				const LinkError error = MakeError(ErrorKind::Unauthorized, "No client key is configured", std::string());
+				callback(nullptr, &error);
+			}
+			return true;
+		}
+		std::string body;
+		std::string problem;
+		if (!BuildCreateLinkBody(params, body, problem))
+		{
+			if (callback)
+			{
+				const LinkError error = MakeError(ErrorKind::Validation, problem, std::string());
+				callback(nullptr, &error);
+			}
+			return true;
+		}
+
+		const std::shared_ptr<CreateOp> op = std::make_shared<CreateOp>();
+		op->id = nextOpId_++;
+		op->routePath = params.routePath;
+		op->body = std::move(body);
+		op->done = std::move(callback);
+		ops_[op->id] = op;
+		StartAttempt(op);
+		return true;
+	}
+
+	void Stop()
+	{
+		if (stopped_)
+		{
+			return;
+		}
+		stopped_ = true;
+		std::map<std::uint64_t, std::shared_ptr<CreateOp>> ops;
+		ops.swap(ops_);
+		for (const auto& entry : ops)
+		{
+			const CreateOp& op = *entry.second;
+			if (op.timerActive)
+			{
+				scheduler_.Cancel(op.timerId);
+			}
+			if (op.httpActive && op.httpId != 0)
+			{
+				transport_.Cancel(op.httpId);
+			}
+		}
+	}
+
+private:
+	struct CreateOp
+	{
+		std::uint64_t id = 0;
+		std::string routePath;
+		/** Built once: every retry sends exactly the same bytes. */
+		std::string body;
+		/** Retries already made. */
+		int retries = 0;
+		/** Changes whenever the op moves on, so late callbacks of an older step are ignored. */
+		std::uint64_t token = 0;
+		std::uint64_t httpId = 0;
+		std::uint64_t timerId = 0;
+		bool httpActive = false;
+		bool timerActive = false;
+		Callback done;
+	};
+
+	std::shared_ptr<CreateOp> FindOp(std::uint64_t opId, std::uint64_t token) const
+	{
+		const auto found = ops_.find(opId);
+		if (found == ops_.end() || found->second->token != token)
+		{
+			return nullptr;
+		}
+		return found->second;
+	}
+
+	void StartAttempt(const std::shared_ptr<CreateOp>& op)
+	{
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		const std::uint64_t opId = op->id;
+		const std::uint64_t token = ++op->token;
+
+		op->timerActive = true;
+		op->timerId = scheduler_.Schedule(config_.timeoutMs, [weak, opId, token]() {
+			if (const std::shared_ptr<Impl> self = weak.lock())
+			{
+				self->OnAttemptTimeout(opId, token);
+			}
+		});
+
+		HttpRequest request;
+		request.method = "POST";
+		request.url = endpoint_;
+		request.headers.emplace_back("Content-Type", "application/json");
+		request.headers.emplace_back("Accept", "application/json");
+		// Not `Authorization`: the key is publishable and must never be taken for a bearer secret.
+		request.headers.emplace_back("X-Strybok-Key", clientKey_);
+		request.body = op->body;
+
+		op->httpActive = true;
+		op->httpId = 0;
+		const std::uint64_t httpId = transport_.Send(request, [weak, opId, token](const HttpResponse& response) {
+			if (const std::shared_ptr<Impl> self = weak.lock())
+			{
+				self->OnAttemptResponse(opId, token, response);
+			}
+		});
+		// The transport may have answered before returning; then there is nothing left to cancel.
+		if (op->token == token && op->httpActive)
+		{
+			op->httpId = httpId;
+		}
+	}
+
+	void OnAttemptResponse(std::uint64_t opId, std::uint64_t token, const HttpResponse& response)
+	{
+		if (stopped_)
+		{
+			return;
+		}
+		const std::shared_ptr<CreateOp> op = FindOp(opId, token);
+		if (!op || !op->httpActive)
+		{
+			return;
+		}
+		op->httpActive = false;
+		if (op->timerActive)
+		{
+			op->timerActive = false;
+			scheduler_.Cancel(op->timerId);
+		}
+
+		const CreateAttemptResult result = ClassifyCreateLinkResponse(op->routePath, response);
+		switch (result.action)
+		{
+		case AttemptAction::Deliver:
+			Finish(op, &result.link, nullptr);
+			break;
+		case AttemptAction::Fail:
+			Finish(op, nullptr, &result.error);
+			break;
+		case AttemptAction::Retry:
+			RetryOrFail(op, result.error);
+			break;
+		}
+	}
+
+	void OnAttemptTimeout(std::uint64_t opId, std::uint64_t token)
+	{
+		if (stopped_)
+		{
+			return;
+		}
+		const std::shared_ptr<CreateOp> op = FindOp(opId, token);
+		if (!op || !op->timerActive)
+		{
+			return;
+		}
+		op->timerActive = false;
+		if (op->httpActive)
+		{
+			op->httpActive = false;
+			if (op->httpId != 0)
+			{
+				transport_.Cancel(op->httpId);
+			}
+		}
+		RetryOrFail(op, MakeError(ErrorKind::Timeout, "The create-link request timed out", std::string()));
+	}
+
+	void RetryOrFail(const std::shared_ptr<CreateOp>& op, const LinkError& error)
+	{
+		if (op->retries >= config_.maxRetries)
+		{
+			Finish(op, nullptr, &error);
+			return;
+		}
+		++op->retries;
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		const std::uint64_t opId = op->id;
+		const std::uint64_t token = ++op->token;
+		op->timerActive = true;
+		op->timerId = scheduler_.Schedule(RetryDelayMs(config_.retryDelayMs, op->retries), [weak, opId, token]() {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (!self || self->stopped_)
+			{
+				return;
+			}
+			const std::shared_ptr<CreateOp> waiting = self->FindOp(opId, token);
+			if (waiting && waiting->timerActive)
+			{
+				waiting->timerActive = false;
+				self->StartAttempt(waiting);
+			}
+		});
+	}
+
+	/** Nothing of this object is touched after the callback: it may stop or destroy the creator. */
+	void Finish(const std::shared_ptr<CreateOp>& op, const CreatedLink* link, const LinkError* error)
+	{
+		ops_.erase(op->id);
+		++op->token;
+		const Callback done = std::move(op->done);
+		op->done = nullptr;
+		if (done)
+		{
+			done(link, error);
+		}
+	}
+
+	Config config_;
+	std::string clientKey_;
+	std::string endpoint_;
+	IHttpTransport& transport_;
+	IScheduler& scheduler_;
+	bool stopped_ = false;
+	std::map<std::uint64_t, std::shared_ptr<CreateOp>> ops_;
+	std::uint64_t nextOpId_ = 1;
+};
+
+LinkCreator::LinkCreator(Config config, IHttpTransport& transport, IScheduler& scheduler)
+	: impl_(std::make_shared<Impl>(std::move(config), transport, scheduler))
+{
+}
+
+LinkCreator::~LinkCreator()
+{
+	impl_->Stop();
+}
+
+bool LinkCreator::Create(const CreateLinkParams& params, Callback callback)
+{
+	const std::shared_ptr<Impl> keepAlive = impl_;
+	return keepAlive->Create(params, std::move(callback));
+}
+
+std::size_t LinkCreator::InFlightCount() const
+{
+	return impl_->InFlightCount();
+}
+
+bool LinkCreator::IsStopped() const
+{
+	return impl_->IsStopped();
+}
+
+void LinkCreator::Stop()
 {
 	const std::shared_ptr<Impl> keepAlive = impl_;
 	keepAlive->Stop();

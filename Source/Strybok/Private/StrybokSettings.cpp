@@ -23,5 +23,6 @@ FStrybokConfig UStrybokSettings::ToConfig() const
 	Config.RetryDelaySeconds = RetryDelaySeconds;
 	Config.DedupeWindowSeconds = DedupeWindowSeconds;
 	Config.bReportAppOpens = bReportAppOpens;
+	Config.ClientKey = ClientKey;
 	return Config;
 }

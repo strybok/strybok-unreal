@@ -5,7 +5,7 @@
 
 class FJsonObject;
 
-/** Why a link could not be resolved. */
+/** Why a link could not be resolved, or could not be created. */
 UENUM(BlueprintType)
 enum class EStrybokErrorKind : uint8
 {
@@ -21,6 +21,14 @@ enum class EStrybokErrorKind : uint8
 	Server,
 	/** Unreal only: the subsystem has not been configured yet (or was shut down). */
 	NotConfigured,
+	/** CreateLink only: no client key is set (no network call), or the service refused it (HTTP 401): wrong or replaced key, or the feature is switched off. */
+	Unauthorized,
+	/** CreateLink only: the route is not covered by the application's route patterns (HTTP 403); see RoutePath. */
+	RouteNotAllowed,
+	/** CreateLink only: too many requests or the daily limit is reached (HTTP 429); see RetryAfterSeconds. */
+	RateLimited,
+	/** CreateLink only: rejected before sending (bad route or payload), or by the service (HTTP 400, 413, 422); see Issues. */
+	Validation,
 };
 
 /**
@@ -67,6 +75,20 @@ struct STRYBOK_API FStrybokResolvedLink
 	TArray<FString> GetRouteSegments() const;
 };
 
+/** One problem the service found in a CreateLink request. */
+USTRUCT(BlueprintType)
+struct STRYBOK_API FStrybokValidationIssue
+{
+	GENERATED_BODY()
+
+	/** Which field, for example "title" or "payload.a". May be empty. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Path;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Message;
+};
+
 USTRUCT(BlueprintType)
 struct STRYBOK_API FStrybokError
 {
@@ -82,9 +104,72 @@ struct STRYBOK_API FStrybokError
 	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
 	FString Url;
 
-	/** HTTP status code for Server and LinkNotFound errors, otherwise 0. */
+	/** HTTP status code of the answer when there was one, otherwise 0. */
 	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
 	int32 StatusCode = 0;
+
+	/** RouteNotAllowed: the route that was refused. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString RoutePath;
+
+	/** RateLimited: seconds to wait, from the Retry-After header. -1 when the service did not say. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	int32 RetryAfterSeconds = -1;
+
+	/** Validation from the service: what it found wrong, if it said so. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	TArray<FStrybokValidationIssue> Issues;
+};
+
+/**
+ * What UStrybokSubsystem::CreateLink sends. Only RoutePath is required; a field left empty is not
+ * sent. Do not put personal data in the route or the payload: whoever receives the link can read
+ * them.
+ */
+USTRUCT(BlueprintType)
+struct STRYBOK_API FStrybokCreateLinkRequest
+{
+	GENERATED_BODY()
+
+	/** In-app route the link opens, for example "/product/42". Starts with one "/", at most 512 characters. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString RoutePath;
+
+	/** Optional JSON object as text, for example {"productId":42}. Arrays and plain values are rejected. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString PayloadJson;
+
+	/** Optional title of the link preview. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString Title;
+
+	/** Optional description of the link preview. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString Description;
+
+	/** Optional image of the link preview; a public https URL. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString ImageUrl;
+};
+
+/** A link made by UStrybokSubsystem::CreateLink. */
+USTRUCT(BlueprintType)
+struct STRYBOK_API FStrybokCreatedLink
+{
+	GENERATED_BODY()
+
+	/** What the user shares, for example https://my-app.strybok.link/Ab3xK9. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Url;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Slug;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString RoutePath;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString LinkId;
 };
 
 /** Options of the SDK. The defaults are the ones of the SDK contract. */
@@ -120,6 +205,13 @@ struct STRYBOK_API FStrybokConfig
 	/** Send a best-effort app_open event after a link was resolved. No device identifiers are sent. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
 	bool bReportAppOpens = true;
+
+	/**
+	 * Publishable client key of the application ("pk_..."), from the dashboard. Only needed for
+	 * CreateLink. It is safe to ship in the game. Never put a secret API key ("lb_...") here.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
+	FString ClientKey;
 };
 
 /** A resolved link, delivered exactly once. */
@@ -130,6 +222,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FStrybokLinkFailed, const FStrybokEr
 
 /** Result of UStrybokSubsystem::ResolveUrl. Link is valid when bSuccess, otherwise Error is. */
 DECLARE_DYNAMIC_DELEGATE_ThreeParams(FStrybokResolveCompleted, bool, bSuccess, const FStrybokResolvedLink&, Link, const FStrybokError&, Error);
+
+/** Result of UStrybokSubsystem::CreateLink. Link is valid when bSuccess, otherwise Error is. */
+DECLARE_DYNAMIC_DELEGATE_ThreeParams(FStrybokCreateLinkCompleted, bool, bSuccess, const FStrybokCreatedLink&, Link, const FStrybokError&, Error);
 
 /** Result of UStrybokSubsystem::GetInitialLink. Link is valid when bHasLink. */
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FStrybokInitialLinkCompleted, bool, bHasLink, const FStrybokResolvedLink&, Link);
