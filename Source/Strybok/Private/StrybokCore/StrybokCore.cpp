@@ -925,6 +925,13 @@ std::string BuildAppOpenBody(
 namespace json
 {
 
+Value::Value() = default;
+Value::Value(const Value& other) = default;
+Value::Value(Value&& other) noexcept = default;
+Value& Value::operator=(const Value& other) = default;
+Value& Value::operator=(Value&& other) noexcept = default;
+Value::~Value() = default;
+
 const Value* Value::Find(const std::string& key) const
 {
 	const Value* found = nullptr;

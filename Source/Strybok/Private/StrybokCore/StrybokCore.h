@@ -247,6 +247,15 @@ enum class Type
 
 struct Value
 {
+	// Declared here and defaulted in the .cpp: `members` holds pairs of this (still incomplete)
+	// type, and libstdc++ rejects implicit special members instantiated inside the class.
+	Value();
+	Value(const Value& other);
+	Value(Value&& other) noexcept;
+	Value& operator=(const Value& other);
+	Value& operator=(Value&& other) noexcept;
+	~Value();
+
 	Type type = Type::Null;
 	bool boolean = false;
 	/** Decoded text for `String`; the literal as written for `Number`. */
