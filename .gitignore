@@ -1,0 +1,11 @@
+# Unreal build output
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# Core test binaries, if someone builds them inside the package
+Tests/out/
+*.dSYM/
+
+.DS_Store

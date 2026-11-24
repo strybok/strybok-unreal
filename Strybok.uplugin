@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Strybok",
+	"Description": "Deep links for mobile games: receives iOS Universal Links and Android App Links, resolves them through the Strybok API to an in-app route and payload, and delivers each link exactly once.",
+	"Category": "Mobile",
+	"CreatedBy": "Strybok",
+	"CreatedByURL": "https://strybok.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "Strybok",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

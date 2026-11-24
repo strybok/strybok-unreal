@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Strybok: Android App Links for Unreal Engine (Unreal Plugin Language).
+
+  1. Adds an auto-verified https intent filter for the host configured in
+     Project Settings > Plugins > Strybok > Link Host
+     (Config/DefaultGame.ini, [/Script/Strybok.StrybokSettings], LinkHost=...) to GameActivity.
+  2. Adds Java glue to GameActivity that passes the URL of the launch intent (onCreate) and of
+     later intents (onNewIntent) to native code: Private/Android/StrybokAndroidLinks.cpp.
+
+  Hosts listed under Additional Allowed Hosts are not added here; see docs/unreal.md.
+-->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<init>
+		<setStringFromProperty result="StrybokLinkHost" ini="Game" section="/Script/Strybok.StrybokSettings" property="LinkHost" default=""/>
+		<setBoolIsEqual result="bStrybokNoLinkHost" arg1="$S(StrybokLinkHost)" arg2=""/>
+		<if condition="bStrybokNoLinkHost">
+			<true>
+				<log text="Strybok: Link Host is empty, no App Links intent filter will be added to AndroidManifest.xml"/>
+			</true>
+			<false>
+				<log text="Strybok: adding App Links intent filter for https://$S(StrybokLinkHost)"/>
+			</false>
+		</if>
+	</init>
+
+	<androidManifestUpdates>
+		<if condition="bStrybokNoLinkHost">
+			<false>
+				<loopElements tag="activity">
+					<setStringFromAttribute result="StrybokActivityName" tag="$" name="android:name"/>
+					<setBoolIsEqual result="bStrybokIsGameActivity" arg1="$S(StrybokActivityName)" arg2="com.epicgames.unreal.GameActivity"/>
+					<if condition="bStrybokIsGameActivity">
+						<true>
+							<!--
+								<intent-filter android:autoVerify="true">
+									<action android:name="android.intent.action.VIEW"/>
+									<category android:name="android.intent.category.DEFAULT"/>
+									<category android:name="android.intent.category.BROWSABLE"/>
+									<data android:scheme="https" android:host="(Link Host)"/>
+								</intent-filter>
+								The whole host is declared, without a path filter: the slug is resolved at runtime.
+							-->
+							<setElement result="StrybokIntentFilter" value="intent-filter"/>
+							<addAttribute tag="$StrybokIntentFilter" name="android:autoVerify" value="true"/>
+							<addElements tag="$StrybokIntentFilter">
+								<action android:name="android.intent.action.VIEW"/>
+								<category android:name="android.intent.category.DEFAULT"/>
+								<category android:name="android.intent.category.BROWSABLE"/>
+							</addElements>
+							<setElement result="StrybokIntentData" value="data"/>
+							<addAttribute tag="$StrybokIntentData" name="android:scheme" value="https"/>
+							<addAttribute tag="$StrybokIntentData" name="android:host" value="$S(StrybokLinkHost)"/>
+							<addElement tag="$StrybokIntentFilter" name="StrybokIntentData"/>
+							<addElement tag="$" name="StrybokIntentFilter"/>
+						</true>
+					</if>
+				</loopElements>
+			</false>
+		</if>
+	</androidManifestUpdates>
+
+	<gameActivityClassAdditions>
+		<insert>
+	// ---- Strybok ----
+	public native void nativeStrybokOnUrl(String url);
+
+	private void strybokHandleIntent(android.content.Intent intent)
+	{
+		try
+		{
+			if (intent == null || !android.content.Intent.ACTION_VIEW.equals(intent.getAction()))
+			{
+				return;
+			}
+			// The activity was brought back from the recents list: this intent is an old tap.
+			if ((intent.getFlags() &amp; android.content.Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0)
+			{
+				return;
+			}
+			android.net.Uri data = intent.getData();
+			if (data == null || !"https".equalsIgnoreCase(data.getScheme()))
+			{
+				return;
+			}
+			nativeStrybokOnUrl(data.toString());
+		}
+		catch (Throwable error)
+		{
+			android.util.Log.w("Strybok", "Could not hand the link to native code: " + error);
+		}
+	}
+	// ---- /Strybok ----
+		</insert>
+	</gameActivityClassAdditions>
+
+	<!-- The link that started the app (cold start). -->
+	<gameActivityOnCreateAdditions>
+		<insert>
+		strybokHandleIntent(getIntent());
+		</insert>
+	</gameActivityOnCreateAdditions>
+
+	<!-- A link received while the app is running; GameActivity has already called setIntent(newIntent). -->
+	<gameActivityOnNewIntentAdditions>
+		<insert>
+		strybokHandleIntent(getIntent());
+		</insert>
+	</gameActivityOnNewIntentAdditions>
+
+	<proguardAdditions>
+		<insert>
+-keepclassmembers class com.epicgames.unreal.GameActivity {
+	public native void nativeStrybokOnUrl(java.lang.String);
+}
+		</insert>
+	</proguardAdditions>
+</root>
