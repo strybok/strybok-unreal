@@ -9,9 +9,9 @@ Deferred links (restoring a link after a store install) are specified in
 [Deferred links (Android)](#deferred-links-optional-android) and
 [Deferred links on iOS](#deferred-links-on-ios-optional): optional, off by default, and very
 different on the two platforms. Which SDK versions implement them is listed in
-[Which SDKs implement deferred links](#which-sdks-implement-deferred-links). All of them are
-unreleased at the time of writing and **none has run on a device, against a real store, with a
-real pasteboard or against the production API**. There is no automatic deferred deep linking on
+[Which SDKs implement deferred links](#which-sdks-implement-deferred-links). All of them were
+released on 2026-11-25 and **none has run on a device, against a real store, with a real
+pasteboard or against the production API**. There is no automatic deferred deep linking on
 iOS. An SDK version without the `deferredLinks` option restores nothing after installation.
 
 ## Configuration
@@ -864,10 +864,10 @@ SDKs drop it from the URL like every other non-campaign parameter).
 
 ## Which SDKs implement deferred links
 
-All versions below are **unreleased** at the time of writing (2026-11-25) and are covered by unit
-tests against fake sources and a stub transport only. Nothing has run on a device, against a
-real store, with a real pasteboard or against the production API, and the server side is not
-deployed to production yet. Everything is optional and off by default.
+All versions below were released on 2026-11-25 and are covered by unit tests against fake
+sources and a stub transport only. Nothing has run on a device, against a real store, with a
+real pasteboard or against the production API, although the server side has been deployed there
+since 2026-11-25. Everything is optional and off by default.
 
 | SDK                                     | Version | Android (store referrer)                                                                                                                                                        | iOS flow A (pasted link)                                 | iOS flow B (probabilistic matching)                                     |
 | --------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------- |

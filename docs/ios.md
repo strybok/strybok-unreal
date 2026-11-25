@@ -106,7 +106,7 @@ opens it, the app starts on its first screen. That is Apple's platform, not a mi
 the App Store passes nothing from a link to a newly installed app, so everything below is a
 trade-off, and **there is no automatic deferred deep linking on iOS**. Nothing here has been
 verified on a device, with a real pasteboard or against the production service. The app side is
-implemented, in versions that are not released yet, by the **iOS SDK (Swift) 0.4.0** — see
+implemented, in the versions released on 2026-11-25, by the **iOS SDK (Swift) 0.4.0** — see
 [Deferred links (optional)](https://github.com/strybok/strybok-ios) — and by Kotlin
 Multiplatform 0.4.0; Flutter, JavaScript, React Native, Capacitor, Unity, .NET and Unreal 0.3.0
 implement the flow but your app supplies the pasted text (and, for matching, the device family

@@ -104,8 +104,8 @@ decision 0017.
 
 ## Links tapped before the app is installed (deferred links)
 
-Optional and off by default. The server side exists, and the app side is implemented in SDK
-versions that are **not released yet**: the Android SDK and Kotlin Multiplatform 0.4.0 ship the
+Optional and off by default. The server side is deployed, and the app side is implemented in the
+SDK versions released on 2026-11-25: the Android SDK and Kotlin Multiplatform 0.4.0 ship the
 store referrer sources (you add the store's library); Flutter, JavaScript, React Native,
 Capacitor, Unity, .NET and Unreal 0.3.0 implement the flow but your app has to hand them the
 referrer string (see

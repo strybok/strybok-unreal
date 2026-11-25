@@ -52,9 +52,9 @@ For every failure note the OS version, where the link was tapped, and the output
 ## Deferred links (decision 0019)
 
 > **Results: not executed.** The scenarios can be run now — the Android and Kotlin Multiplatform
-> SDKs 0.4.0 (unreleased) implement deferred links with the three store sources — but none has
-> been: so far the feature is covered by unit tests only, and the server side is not deployed to
-> production. D7, D8, D15, D19, D20 and D24 can also be run with a test app that only prints
+> SDKs 0.4.0 (released 2026-11-25) implement deferred links with the three store sources, and
+> the server side is deployed to production — but none has been: so far the feature is covered
+> by unit tests only. D7, D8, D15, D19, D20 and D24 can also be run with a test app that only prints
 > what the store's install referrer returns, and they decide whether the Huawei and Samsung
 > rows of the store table are right.
 
@@ -93,7 +93,7 @@ referrer string.
 ### iOS options
 
 > **Results: not executed.** The scenarios can be run now — the iOS SDK (Swift) and Kotlin
-> Multiplatform 0.4.0 (unreleased) implement both flows — but none has been: unit tests only, no
+> Multiplatform 0.4.0 (released 2026-11-25) implement both flows — but none has been: unit tests only, no
 > device, no real pasteboard. I10–I17 additionally need a service with the matching secret set,
 > which the hosted production service does not have today. I3, I8 and I9 can be run with Safari
 > alone (the page and the clipboard); the rest need an app.
