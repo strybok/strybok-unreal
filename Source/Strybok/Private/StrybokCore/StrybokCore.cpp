@@ -9,7 +9,7 @@
 namespace strybok
 {
 
-const char* const kSdkVersion = "0.2.0";
+const char* const kSdkVersion = "0.3.0";
 
 IHttpTransport::~IHttpTransport() = default;
 IScheduler::~IScheduler() = default;
@@ -25,6 +25,8 @@ const int kMaxJsonDepth = 64;
 const int kMaxRetriesLimit = 10;
 const std::size_t kMaxRoutePathLength = 512;
 const std::int64_t kMaxRetryAfterSeconds = 2147483647;
+const int kMaxDeferredAttempts = 3;
+const std::int64_t kSourceTimeoutMs = 10000;
 
 bool IsAsciiSpace(char c)
 {
@@ -119,7 +121,79 @@ struct OurUrl
 {
 	std::string host;
 	std::string path;
+	/** Between `?` and `#` (or the end), without the `?`; empty when there is no query. */
+	std::string rawQuery;
 };
+
+int HexValue(char c)
+{
+	if (c >= '0' && c <= '9')
+	{
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f')
+	{
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F')
+	{
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+bool IsUnreserved(char c)
+{
+	return IsAsciiAlnum(c) || c == '.' || c == '_' || c == '~' || c == '-';
+}
+
+/**
+ * Percent-decodes `text[begin, end)` (`+` is a space) into `out` and returns true only when the
+ * result consists of `A-Z a-z 0-9 . _ ~ -`.
+ *
+ * Campaign keys and valid values are made of these characters only, so anything else - a space,
+ * a malformed escape, any byte of a multi-byte UTF-8 sequence (valid or not), a NUL - can only
+ * belong to a key that is not ours or to a value that is dropped. No UTF-8 decoding is needed
+ * for that, and no byte of the input is ever trusted.
+ */
+bool DecodeUnreserved(const std::string& text, std::size_t begin, std::size_t end, std::string& out)
+{
+	out.clear();
+	std::size_t i = begin;
+	while (i < end)
+	{
+		char c = text[i];
+		if (c == '%')
+		{
+			if (end - i < 3)
+			{
+				return false;
+			}
+			const int high = HexValue(text[i + 1]);
+			const int low = HexValue(text[i + 2]);
+			if (high < 0 || low < 0)
+			{
+				return false;
+			}
+			c = static_cast<char>(static_cast<unsigned char>(high * 16 + low));
+			i += 3;
+		}
+		else
+		{
+			i += 1;
+		}
+		if (!IsUnreserved(c))
+		{
+			return false;
+		}
+		out.push_back(c);
+	}
+	return true;
+}
+
+const char* const kCampaignQueryKeys[] = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"};
+const std::size_t kCampaignKeyCount = sizeof(kCampaignQueryKeys) / sizeof(kCampaignQueryKeys[0]);
+const std::size_t kMaxCampaignValueLength = 64;
 
 /** The single place that decides whether a URL is ours. */
 bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, OurUrl& outParts)
@@ -175,7 +249,7 @@ bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normali
 		return false;
 	}
 
-	// Exactly one slug segment; query and fragment are ignored.
+	// Exactly one slug segment; query and fragment do not decide anything.
 	std::size_t pathEnd = url.find_first_of("?#", authorityEnd);
 	if (pathEnd == std::string::npos)
 	{
@@ -189,6 +263,16 @@ bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normali
 
 	outParts.host = host;
 	outParts.path = path;
+	outParts.rawQuery.clear();
+	if (pathEnd < url.size() && url[pathEnd] == '?')
+	{
+		std::size_t queryEnd = url.find('#', pathEnd);
+		if (queryEnd == std::string::npos)
+		{
+			queryEnd = url.size();
+		}
+		outParts.rawQuery = url.substr(pathEnd + 1, queryEnd - pathEnd - 1);
+	}
 	return true;
 }
 
@@ -756,8 +840,68 @@ bool BuildLookupUrl(const std::string& url, const std::vector<std::string>& norm
 	{
 		return false;
 	}
-	outLookup = "https://" + parts.host + parts.path;
+	// Of the query only the campaign parameters are sent; the rest and the fragment may hold
+	// private data.
+	outLookup = "https://" + parts.host + parts.path + BuildCampaignQuery(parts.rawQuery);
 	return true;
+}
+
+std::string BuildCampaignQuery(const std::string& rawQuery)
+{
+	std::string values[kCampaignKeyCount];
+	bool seen[kCampaignKeyCount] = {};
+	std::string decoded;
+
+	std::size_t begin = 0;
+	while (begin <= rawQuery.size() && !rawQuery.empty())
+	{
+		std::size_t end = rawQuery.find('&', begin);
+		if (end == std::string::npos)
+		{
+			end = rawQuery.size();
+		}
+		std::size_t equals = rawQuery.find('=', begin);
+		const bool hasValue = equals != std::string::npos && equals < end;
+		const std::size_t keyEnd = hasValue ? equals : end;
+
+		if (DecodeUnreserved(rawQuery, begin, keyEnd, decoded))
+		{
+			for (std::size_t index = 0; index < kCampaignKeyCount; ++index)
+			{
+				if (decoded != kCampaignQueryKeys[index])
+				{
+					continue;
+				}
+				if (!seen[index])
+				{
+					// The first occurrence counts, even when its value is dropped.
+					seen[index] = true;
+					std::string value;
+					if (hasValue && DecodeUnreserved(rawQuery, equals + 1, end, value) &&
+						!value.empty() && value.size() <= kMaxCampaignValueLength)
+					{
+						values[index] = value;
+					}
+				}
+				break;
+			}
+		}
+		begin = end + 1;
+	}
+
+	std::string query;
+	for (std::size_t index = 0; index < kCampaignKeyCount; ++index)
+	{
+		if (values[index].empty())
+		{
+			continue;
+		}
+		query += query.empty() ? '?' : '&';
+		query += kCampaignQueryKeys[index];
+		query += '=';
+		query += values[index];
+	}
+	return query;
 }
 
 std::string PercentEncode(const std::string& value)
@@ -848,6 +992,23 @@ bool ParseResolveBody(const std::string& uri, const std::string& body, ResolvedL
 	{
 		outLink.payloadJson = body.substr(payload->begin, payload->end - payload->begin);
 	}
+	const json::Value* campaign = root.Find("campaign");
+	if (campaign != nullptr && campaign->type == json::Type::Object)
+	{
+		// Only the five string fields; a missing or odd one is simply not there.
+		const auto read = [campaign](const char* key, std::string& out) {
+			const json::Value* value = campaign->Find(key);
+			if (value != nullptr && value->type == json::Type::String)
+			{
+				out = value->text;
+			}
+		};
+		read("source", outLink.campaign.source);
+		read("medium", outLink.campaign.medium);
+		read("campaign", outLink.campaign.campaign);
+		read("term", outLink.campaign.term);
+		read("content", outLink.campaign.content);
+	}
 	return true;
 }
 
@@ -915,7 +1076,8 @@ std::string BuildAppOpenBody(
 	const std::string& eventId,
 	const std::string& linkId,
 	const std::string& platform,
-	const std::string& sdkVersion)
+	const std::string& sdkVersion,
+	const Campaign& campaign)
 {
 	const std::string version = sdkVersion.empty() ? std::string(kSdkVersion) : sdkVersion;
 	std::string body = "{\"eventId\":";
@@ -926,8 +1088,361 @@ std::string BuildAppOpenBody(
 	body += json::Quote(platform);
 	body += ",\"sdkVersion\":";
 	body += json::Quote(version.substr(0, kMaxSdkVersionLength));
+	if (!campaign.IsEmpty())
+	{
+		// What resolve returned, unchanged; an empty field is one the server did not send.
+		body += ",\"campaign\":{";
+		bool first = true;
+		const auto append = [&body, &first](const char* key, const std::string& value) {
+			if (value.empty())
+			{
+				return;
+			}
+			if (!first)
+			{
+				body += ",";
+			}
+			first = false;
+			body += "\"";
+			body += key;
+			body += "\":";
+			body += json::Quote(value);
+		};
+		append("source", campaign.source);
+		append("medium", campaign.medium);
+		append("campaign", campaign.campaign);
+		append("term", campaign.term);
+		append("content", campaign.content);
+		body += "}";
+	}
 	body += "}";
 	return body;
+}
+
+// --- deferred links ---
+
+const char* const kDeferredAttemptsKey = "strybok.deferred.attempts";
+const char* const kDeferredDoneKey = "strybok.deferred.done";
+
+IDeferredLinkStore::~IDeferredLinkStore() = default;
+
+namespace
+{
+
+const char* const kClickKey = "strybok_click";
+const std::size_t kClickKeyLength = 13;
+
+/** `^dc_[0-9A-Za-z]{32}$` */
+bool IsClickId(const std::string& value)
+{
+	if (value.size() != 35 || value[0] != 'd' || value[1] != 'c' || value[2] != '_')
+	{
+		return false;
+	}
+	for (std::size_t index = 3; index < value.size(); ++index)
+	{
+		if (!IsAsciiAlnum(value[index]))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Looks for the first part of `text` (split on `&`, each part on its first `=`) whose key is
+ * exactly `strybok_click`, compared as it stands. Returns whether such a part exists; `outClickId`
+ * is filled only when its value is a click id.
+ */
+bool FindRawClickPart(const std::string& text, std::string& outClickId)
+{
+	outClickId.clear();
+	std::size_t begin = 0;
+	while (begin <= text.size())
+	{
+		std::size_t end = text.find('&', begin);
+		if (end == std::string::npos)
+		{
+			end = text.size();
+		}
+		const std::size_t equals = text.find('=', begin);
+		const bool hasValue = equals != std::string::npos && equals < end;
+		const std::size_t keyEnd = hasValue ? equals : end;
+		if (keyEnd - begin == kClickKeyLength && text.compare(begin, kClickKeyLength, kClickKey) == 0)
+		{
+			// The first occurrence decides, even when its value is unusable.
+			if (hasValue)
+			{
+				const std::string value = text.substr(equals + 1, end - equals - 1);
+				if (IsClickId(value))
+				{
+					outClickId = value;
+				}
+			}
+			return true;
+		}
+		begin = end + 1;
+	}
+	return false;
+}
+
+bool ContainsEncodedClickKey(const std::string& text)
+{
+	static const char kNeedle[] = "strybok_click%3d";
+	const std::size_t needleLength = sizeof(kNeedle) - 1;
+	if (text.size() < needleLength)
+	{
+		return false;
+	}
+	for (std::size_t start = 0; start + needleLength <= text.size(); ++start)
+	{
+		std::size_t index = 0;
+		while (index < needleLength && AsciiLower(text[start + index]) == kNeedle[index])
+		{
+			++index;
+		}
+		if (index == needleLength)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Plain percent-decoding of the whole string (`+` stays `+`). False on a malformed escape. */
+bool PercentDecodeOnce(const std::string& text, std::string& out)
+{
+	out.clear();
+	out.reserve(text.size());
+	std::size_t i = 0;
+	while (i < text.size())
+	{
+		if (text[i] != '%')
+		{
+			out.push_back(text[i]);
+			++i;
+			continue;
+		}
+		if (text.size() - i < 3)
+		{
+			return false;
+		}
+		const int high = HexValue(text[i + 1]);
+		const int low = HexValue(text[i + 2]);
+		if (high < 0 || low < 0)
+		{
+			return false;
+		}
+		out.push_back(static_cast<char>(static_cast<unsigned char>(high * 16 + low)));
+		i += 3;
+	}
+	return true;
+}
+
+std::string TrimAsciiSpace(const std::string& value)
+{
+	std::size_t begin = 0;
+	std::size_t end = value.size();
+	while (begin < end && IsAsciiSpace(value[begin]))
+	{
+		++begin;
+	}
+	while (end > begin && IsAsciiSpace(value[end - 1]))
+	{
+		--end;
+	}
+	return value.substr(begin, end - begin);
+}
+
+std::string DeferredSdkVersion(const std::string& sdkVersion)
+{
+	const std::string version = sdkVersion.empty() ? std::string(kSdkVersion) : sdkVersion;
+	return version.substr(0, kMaxSdkVersionLength);
+}
+
+} // namespace
+
+std::string BuildDeferredRedeemEndpoint(const std::string& apiBaseUrl)
+{
+	return TrimTrailingSlashes(apiBaseUrl) + "/v1/public/deferred-links/redeem";
+}
+
+std::string BuildDeferredMatchEndpoint(const std::string& apiBaseUrl)
+{
+	return TrimTrailingSlashes(apiBaseUrl) + "/v1/public/deferred-links/match";
+}
+
+bool FindClickIdInReferrer(const std::string& referrer, std::string& outClickId)
+{
+	if (FindRawClickPart(referrer, outClickId))
+	{
+		return !outClickId.empty();
+	}
+	// A store may hand the value back still encoded.
+	std::string decoded;
+	if (!ContainsEncodedClickKey(referrer) || !PercentDecodeOnce(referrer, decoded))
+	{
+		return false;
+	}
+	return FindRawClickPart(decoded, outClickId) && !outClickId.empty();
+}
+
+bool FindClickIdInPastedLink(
+	const std::string& text, const std::vector<std::string>& normalizedHosts, std::string& outClickId)
+{
+	outClickId.clear();
+	OurUrl parts;
+	if (!ParseOurUrl(TrimAsciiSpace(text), normalizedHosts, parts))
+	{
+		return false;
+	}
+	// Standard query parsing, as for the campaign query. The key and a valid id consist of
+	// unreserved characters only, so anything `DecodeUnreserved` refuses cannot be either.
+	const std::string& query = parts.rawQuery;
+	std::string decoded;
+	std::size_t begin = 0;
+	while (begin <= query.size() && !query.empty())
+	{
+		std::size_t end = query.find('&', begin);
+		if (end == std::string::npos)
+		{
+			end = query.size();
+		}
+		const std::size_t equals = query.find('=', begin);
+		const bool hasValue = equals != std::string::npos && equals < end;
+		const std::size_t keyEnd = hasValue ? equals : end;
+		if (DecodeUnreserved(query, begin, keyEnd, decoded) && decoded == kClickKey)
+		{
+			// The first occurrence decides.
+			std::string value;
+			if (hasValue && DecodeUnreserved(query, equals + 1, end, value) && IsClickId(value))
+			{
+				outClickId = value;
+				return true;
+			}
+			return false;
+		}
+		begin = end + 1;
+	}
+	return false;
+}
+
+std::string BuildAndroidRedeemBody(
+	const std::string& clickId, const std::string& packageName, const std::string& sdkVersion)
+{
+	std::string body = "{\"platform\":\"android\",\"clickId\":";
+	body += json::Quote(clickId);
+	body += ",\"packageName\":";
+	body += json::Quote(packageName);
+	body += ",\"sdkVersion\":";
+	body += json::Quote(DeferredSdkVersion(sdkVersion));
+	body += "}";
+	return body;
+}
+
+std::string BuildIosRedeemBody(
+	const std::string& clickId, const std::string& bundleId, const std::string& sdkVersion)
+{
+	std::string body = "{\"platform\":\"ios\",\"clickId\":";
+	body += json::Quote(clickId);
+	body += ",\"bundleId\":";
+	body += json::Quote(bundleId);
+	body += ",\"sdkVersion\":";
+	body += json::Quote(DeferredSdkVersion(sdkVersion));
+	body += "}";
+	return body;
+}
+
+std::string BuildMatchBody(
+	const std::string& bundleId,
+	const std::string& deviceFamily,
+	const std::string& locale,
+	const std::string& sdkVersion)
+{
+	std::string body = "{\"platform\":\"ios\",\"bundleId\":";
+	body += json::Quote(bundleId);
+	body += ",\"deviceFamily\":";
+	body += json::Quote(deviceFamily);
+	body += ",\"locale\":";
+	body += json::Quote(locale);
+	body += ",\"sdkVersion\":";
+	body += json::Quote(DeferredSdkVersion(sdkVersion));
+	body += "}";
+	return body;
+}
+
+bool IsMatchDeviceFamily(const std::string& value)
+{
+	return value == "iphone" || value == "ipad" || value == "ipod";
+}
+
+bool IsMatchLocale(const std::string& value)
+{
+	const auto isAlpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+	std::size_t index = 0;
+	while (index < value.size() && isAlpha(value[index]))
+	{
+		++index;
+	}
+	if (index < 2 || index > 3)
+	{
+		return false;
+	}
+	int subtags = 0;
+	while (index < value.size())
+	{
+		if (value[index] != '-' && value[index] != '_')
+		{
+			return false;
+		}
+		++index;
+		const std::size_t begin = index;
+		while (index < value.size() && IsAsciiAlnum(value[index]))
+		{
+			++index;
+		}
+		const std::size_t length = index - begin;
+		if (length < 1 || length > 8 || ++subtags > 4)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ParseDeferredBody(
+	const std::string& body,
+	const std::vector<std::string>& normalizedHosts,
+	bool requireProbabilistic,
+	ResolvedLink& outLink)
+{
+	json::Value root;
+	if (!json::Parse(body, root) || root.type != json::Type::Object)
+	{
+		return false;
+	}
+	const json::Value* deferred = root.Find("deferred");
+	const json::Value* url = root.Find("url");
+	if (deferred == nullptr || deferred->type != json::Type::Bool || !deferred->boolean ||
+		url == nullptr || url->type != json::Type::String || !IsStrybokUrl(url->text, normalizedHosts))
+	{
+		return false;
+	}
+	if (requireProbabilistic)
+	{
+		const json::Value* matched = root.Find("matched");
+		if (matched == nullptr || matched->type != json::Type::String || matched->text != "probabilistic")
+		{
+			return false;
+		}
+	}
+	if (!ParseResolveBody(url->text, body, outLink))
+	{
+		return false;
+	}
+	outLink.isDeferred = true;
+	outLink.isProbabilisticMatch = requireProbabilistic;
+	return true;
 }
 
 // --- creating links ---
@@ -1314,6 +1829,77 @@ public:
 		{
 			config_.timeoutMs = 1;
 		}
+		config_.androidPackageName = TrimAsciiSpace(config_.androidPackageName);
+		config_.iosBundleId = TrimAsciiSpace(config_.iosBundleId);
+		sources_ = std::move(config_.installReferrerSources);
+		config_.installReferrerSources.clear();
+		deferredOption_ = config_.deferredLinks;
+		deferredStatus_ = DeferredEffective() ? DeferredLinkStatus::Pending : DeferredLinkStatus::Disabled;
+	}
+
+	// --- deferred links: the public side ---
+
+	DeferredLinkStatus GetDeferredLinkStatus() const { return deferredStatus_; }
+
+	void SetDeferredLinkStatusHandler(std::function<void(DeferredLinkStatus)> handler)
+	{
+		statusHandler_ = std::move(handler);
+	}
+
+	void SetInstallReferrerSources(std::vector<InstallReferrerSource> sources)
+	{
+		if (!stopped_ && !sourcesTaken_)
+		{
+			sources_ = std::move(sources);
+		}
+	}
+
+	void EnableDeferredLinks()
+	{
+		if (stopped_)
+		{
+			return;
+		}
+		deferredOption_ = true;
+		if (!DeferredEffective())
+		{
+			return;
+		}
+		if (deferredStatus_ == DeferredLinkStatus::Disabled)
+		{
+			SetDeferredStatus(DeferredLinkStatus::Pending);
+		}
+		MaybeScheduleCheck();
+	}
+
+	void RedeemPastedLink(const std::string& text, std::function<void(PastedLinkResult)> callback)
+	{
+		if (stopped_ || !DeferredEffective() || !IsIos())
+		{
+			if (callback)
+			{
+				callback(PastedLinkResult::Disabled);
+			}
+			return;
+		}
+		PasteRequest request;
+		request.text = text;
+		request.done = std::move(callback);
+		pasteQueue_.push_back(std::move(request));
+		if (!pasteBusy_)
+		{
+			ProcessNextPaste();
+		}
+	}
+
+	void SkipPastedLink()
+	{
+		if (stopped_ || !awaitingPaste_)
+		{
+			return;
+		}
+		awaitingPaste_ = false;
+		ContinueMatching();
 	}
 
 	// --- configuration of the receiving side ---
@@ -1424,6 +2010,38 @@ public:
 				transport_.Cancel(entry.second.httpId);
 			}
 		}
+
+		std::map<std::uint64_t, std::shared_ptr<PostOp>> posts;
+		posts.swap(posts_);
+		for (const auto& entry : posts)
+		{
+			const PostOp& op = *entry.second;
+			if (op.timerActive)
+			{
+				scheduler_.Cancel(op.timerId);
+			}
+			if (op.httpActive && op.httpId != 0)
+			{
+				transport_.Cancel(op.httpId);
+			}
+		}
+		if (checkTimerActive_)
+		{
+			checkTimerActive_ = false;
+			scheduler_.Cancel(checkTimerId_);
+		}
+		if (askTimerActive_)
+		{
+			askTimerActive_ = false;
+			scheduler_.Cancel(askTimerId_);
+		}
+		++askToken_;
+		awaitingPaste_ = false;
+		pasteBusy_ = false;
+		pasteQueue_.clear();
+		pasteDone_ = nullptr;
+		sources_.clear();
+		statusHandler_ = nullptr;
 
 		pending_.clear();
 		initialSeq_ = 0;
@@ -1589,6 +2207,12 @@ private:
 			const bool found = TakeInitialLink(link);
 			waiter(found ? &link : nullptr);
 		}
+
+		// Last, and on a later scheduler turn: nothing of the start waits for the deferred check.
+		if (!stopped_)
+		{
+			MaybeScheduleCheck();
+		}
 	}
 
 	/** The OS can hand over one tap twice, e.g. as the launch URL and again as a running-app URL. */
@@ -1605,6 +2229,11 @@ private:
 	/** The automatic flow: foreign URLs and duplicates are dropped silently. */
 	void Handle(const std::string& url, bool isInitial, std::function<void()> onDone)
 	{
+		if (!stopped_ && IsOurs(url))
+		{
+			// A normal link wins over a deferred one from this moment on, whatever becomes of it.
+			normalLinkAccepted_ = true;
+		}
 		if (stopped_ || !IsOurs(url) || IsDuplicate(url))
 		{
 			if (onDone && !stopped_)
@@ -1641,7 +2270,9 @@ private:
 
 	void Accept(const ResolvedLink& link, bool isInitial)
 	{
+		// Copied first: the handler may destroy the engine, and with it `link`.
 		const std::string linkId = link.linkId;
+		const Campaign campaign = link.campaign;
 		if (CanDeliver())
 		{
 			const LinkHandler handler = linkHandler_;
@@ -1660,7 +2291,7 @@ private:
 		}
 		if (!stopped_ && config_.reportAppOpens)
 		{
-			ReportAppOpen(linkId);
+			ReportAppOpen(linkId, campaign);
 		}
 	}
 
@@ -1822,10 +2453,717 @@ private:
 		}
 	}
 
+	// --- deferred links (SDK contract, "Deferred links"; nothing here reports an error) ---
+
+	struct PostOp
+	{
+		std::uint64_t id = 0;
+		HttpRequest request;
+		int retries = 0;
+		std::uint64_t token = 0;
+		std::uint64_t httpId = 0;
+		std::uint64_t timerId = 0;
+		bool httpActive = false;
+		bool timerActive = false;
+		/** `answered` is false when the retries ran out without a usable HTTP answer. */
+		std::function<void(bool answered, const HttpResponse& response)> done;
+	};
+
+	struct PasteRequest
+	{
+		std::string text;
+		std::function<void(PastedLinkResult)> done;
+	};
+
+	bool IsAndroid() const { return config_.platform == "android"; }
+	bool IsIos() const { return config_.platform == "ios"; }
+
+	bool DeferredEffective() const
+	{
+		if (!deferredOption_ || !config_.deferredLinkStore)
+		{
+			return false;
+		}
+		return (IsAndroid() && !config_.androidPackageName.empty()) || (IsIos() && !config_.iosBundleId.empty());
+	}
+
+	void SetDeferredStatus(DeferredLinkStatus status)
+	{
+		if (deferredStatus_ == status)
+		{
+			return;
+		}
+		deferredStatus_ = status;
+		const std::function<void(DeferredLinkStatus)> handler = statusHandler_; // it may stop us
+		if (handler)
+		{
+			handler(status);
+		}
+	}
+
+	bool ReadDone(bool& outDone)
+	{
+		std::string value;
+		bool found = false;
+		if (!config_.deferredLinkStore->Read(kDeferredDoneKey, value, found))
+		{
+			return false;
+		}
+		// Anything stored under the key counts: when in doubt, never deliver twice.
+		outDone = found && !value.empty();
+		return true;
+	}
+
+	bool ReadAttempts(int& outAttempts)
+	{
+		std::string value;
+		bool found = false;
+		if (!config_.deferredLinkStore->Read(kDeferredAttemptsKey, value, found))
+		{
+			return false;
+		}
+		outAttempts = 0;
+		if (!found || value.empty())
+		{
+			return true;
+		}
+		for (char c : value)
+		{
+			if (!IsAsciiDigit(c) || outAttempts >= kMaxDeferredAttempts)
+			{
+				// Not a number we wrote, or already past the limit: treat as used up.
+				outAttempts = kMaxDeferredAttempts;
+				return true;
+			}
+			outAttempts = outAttempts * 10 + (c - '0');
+		}
+		return true;
+	}
+
+	/** Remembers `done` at once in memory (so the other flow sees it) and then in the store. */
+	bool StoreDone()
+	{
+		doneMirror_ = true;
+		awaitingPaste_ = false;
+		return config_.deferredLinkStore->Write(kDeferredDoneKey, "1");
+	}
+
+	/** Steps "attempts is 3 or more" and "store attempts + 1". False when the check must stop. */
+	bool BeginAttempt()
+	{
+		int attempts = 0;
+		if (!ReadAttempts(attempts))
+		{
+			SetDeferredStatus(DeferredLinkStatus::Pending);
+			return false;
+		}
+		if (attempts >= kMaxDeferredAttempts)
+		{
+			StoreDone();
+			SetDeferredStatus(DeferredLinkStatus::Failed);
+			return false;
+		}
+		// Before anything else happens: a launch that dies from here on has used up an attempt.
+		if (!config_.deferredLinkStore->Write(kDeferredAttemptsKey, IntToString(attempts + 1)))
+		{
+			SetDeferredStatus(DeferredLinkStatus::Pending);
+			return false;
+		}
+		return true;
+	}
+
+	void MaybeScheduleCheck()
+	{
+		if (stopped_ || !ready_ || checkScheduled_ || !DeferredEffective())
+		{
+			return;
+		}
+		checkScheduled_ = true; // at most once per engine
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		checkTimerActive_ = true;
+		checkTimerId_ = scheduler_.Schedule(0, [weak]() {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (!self || self->stopped_)
+			{
+				return;
+			}
+			self->checkTimerActive_ = false;
+			self->RunCheck();
+		});
+	}
+
+	void RunCheck()
+	{
+		if (doneMirror_)
+		{
+			return; // a pasted link was handled before the check began; its status stands
+		}
+		bool done = false;
+		if (!ReadDone(done))
+		{
+			SetDeferredStatus(DeferredLinkStatus::Pending);
+			return;
+		}
+		if (done)
+		{
+			doneMirror_ = true;
+			SetDeferredStatus(DeferredLinkStatus::NotFirstLaunch);
+			return;
+		}
+		if (IsAndroid())
+		{
+			SetDeferredStatus(DeferredLinkStatus::Checking);
+			if (stopped_ || !BeginAttempt())
+			{
+				return;
+			}
+			sourcesTaken_ = true;
+			askIndex_ = 0;
+			sawReferrer_ = false;
+			sawUnavailableForNow_ = false;
+			AskNextSource();
+			return;
+		}
+
+		// iOS: without matching nothing is automatic; only a pasted link can arrive. `done` is not
+		// stored, so pasting keeps working.
+		if (!config_.allowProbabilisticMatching)
+		{
+			SetDeferredStatus(DeferredLinkStatus::Unavailable);
+			return;
+		}
+		SetDeferredStatus(DeferredLinkStatus::Checking);
+		if (stopped_)
+		{
+			return;
+		}
+		const std::function<void(std::function<void(bool)>)> probe = config_.pasteboardMayContainLink;
+		if (!probe)
+		{
+			ContinueMatching();
+			return;
+		}
+		// Clipboard first: a pasted link is exact, a match is a guess.
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		const std::uint64_t token = ++askToken_;
+		askTimerActive_ = true;
+		askTimerId_ = scheduler_.Schedule(kSourceTimeoutMs, [weak, token]() {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (self && !self->stopped_ && token == self->askToken_)
+			{
+				self->askTimerActive_ = false;
+				self->OnPasteboardAnswer(token, false);
+			}
+		});
+		probe([weak, token](bool mayContainLink) {
+			if (const std::shared_ptr<Impl> self = weak.lock())
+			{
+				self->OnPasteboardAnswer(token, mayContainLink);
+			}
+		});
+	}
+
+	// --- Android: the stores' install referrers ---
+
+	void AskNextSource()
+	{
+		// A loop, not recursion: sources may answer before returning.
+		while (!stopped_)
+		{
+			if (askIndex_ >= sources_.size())
+			{
+				if (sawUnavailableForNow_)
+				{
+					// `done` is not stored: the next launch asks again, until the attempts run out.
+					SetDeferredStatus(DeferredLinkStatus::Pending);
+				}
+				else
+				{
+					StoreDone();
+					SetDeferredStatus(sawReferrer_ ? DeferredLinkStatus::NoReferrer : DeferredLinkStatus::Unavailable);
+				}
+				return;
+			}
+			const InstallReferrerSource source = sources_[askIndex_++];
+			if (!source)
+			{
+				continue; // an empty function can never answer: "unavailable"
+			}
+			const std::weak_ptr<Impl> weak = weak_from_this();
+			const std::uint64_t token = ++askToken_;
+			askTimerActive_ = true;
+			askTimerId_ = scheduler_.Schedule(kSourceTimeoutMs, [weak, token]() {
+				const std::shared_ptr<Impl> self = weak.lock();
+				if (self && !self->stopped_ && token == self->askToken_)
+				{
+					// Too slow: "unavailable for now". The call is abandoned; a late answer is ignored.
+					self->askTimerActive_ = false;
+					InstallReferrerAnswer late;
+					late.kind = InstallReferrerAnswer::Kind::UnavailableForNow;
+					self->OnSourceAnswer(token, late);
+				}
+			});
+			askingInline_ = true;
+			answeredInline_ = false;
+			source([weak, token](const InstallReferrerAnswer& answer) {
+				if (const std::shared_ptr<Impl> self = weak.lock())
+				{
+					self->OnSourceAnswer(token, answer);
+				}
+			});
+			askingInline_ = false;
+			if (!answeredInline_)
+			{
+				return; // the answer comes later and continues from `OnSourceAnswer`
+			}
+			if (redeemStarted_)
+			{
+				return;
+			}
+		}
+	}
+
+	void OnSourceAnswer(std::uint64_t token, const InstallReferrerAnswer& answer)
+	{
+		if (stopped_ || token != askToken_)
+		{
+			return;
+		}
+		++askToken_; // one answer per question
+		if (askTimerActive_)
+		{
+			askTimerActive_ = false;
+			scheduler_.Cancel(askTimerId_);
+		}
+		switch (answer.kind)
+		{
+		case InstallReferrerAnswer::Kind::Referrer:
+		{
+			sawReferrer_ = true;
+			// Only the click id is taken; the rest of the referrer is neither kept nor sent.
+			std::string clickId;
+			if (FindClickIdInReferrer(answer.referrer, clickId))
+			{
+				redeemStarted_ = true;
+				if (askingInline_)
+				{
+					answeredInline_ = true;
+				}
+				RedeemFromReferrer(clickId);
+				return;
+			}
+			break;
+		}
+		case InstallReferrerAnswer::Kind::UnavailableForNow:
+			sawUnavailableForNow_ = true;
+			break;
+		case InstallReferrerAnswer::Kind::Unavailable:
+			break;
+		}
+		if (askingInline_)
+		{
+			answeredInline_ = true; // the loop in `AskNextSource` goes on
+			return;
+		}
+		AskNextSource();
+	}
+
+	void RedeemFromReferrer(const std::string& clickId)
+	{
+		if (normalLinkAccepted_)
+		{
+			// A normal link wins: the id is not even sent.
+			StoreDone();
+			SetDeferredStatus(DeferredLinkStatus::Superseded);
+			return;
+		}
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		StartPost(
+			BuildDeferredRedeemEndpoint(config_.apiBaseUrl),
+			BuildAndroidRedeemBody(clickId, config_.androidPackageName, config_.sdkVersion),
+			[weak](bool answered, const HttpResponse& response) {
+				const std::shared_ptr<Impl> self = weak.lock();
+				if (self && !self->stopped_)
+				{
+					self->OnAutomaticAnswer(answered, response, false);
+				}
+			});
+	}
+
+	// --- iOS: probabilistic matching ---
+
+	void OnPasteboardAnswer(std::uint64_t token, bool mayContainLink)
+	{
+		if (stopped_ || token != askToken_)
+		{
+			return;
+		}
+		++askToken_;
+		if (askTimerActive_)
+		{
+			askTimerActive_ = false;
+			scheduler_.Cancel(askTimerId_);
+		}
+		if (doneMirror_)
+		{
+			return;
+		}
+		if (mayContainLink)
+		{
+			awaitingPaste_ = true;
+			SetDeferredStatus(DeferredLinkStatus::AwaitingPaste);
+			return;
+		}
+		ContinueMatching();
+	}
+
+	void ContinueMatching()
+	{
+		if (stopped_ || doneMirror_)
+		{
+			return;
+		}
+		SetDeferredStatus(DeferredLinkStatus::Checking);
+		if (stopped_ || !BeginAttempt())
+		{
+			return;
+		}
+		if (normalLinkAccepted_)
+		{
+			StoreDone();
+			SetDeferredStatus(DeferredLinkStatus::Superseded);
+			return;
+		}
+		const std::function<std::string()> familyProvider = config_.deviceFamily;
+		const std::function<std::string()> localeProvider = config_.locale;
+		const std::string family = familyProvider ? familyProvider() : std::string();
+		const std::string locale = localeProvider ? localeProvider() : std::string();
+		if (stopped_)
+		{
+			return;
+		}
+		if (!IsMatchDeviceFamily(family) || !IsMatchLocale(locale))
+		{
+			StoreDone();
+			SetDeferredStatus(DeferredLinkStatus::Unavailable);
+			return;
+		}
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		StartPost(
+			BuildDeferredMatchEndpoint(config_.apiBaseUrl),
+			BuildMatchBody(config_.iosBundleId, family, locale, config_.sdkVersion),
+			[weak](bool answered, const HttpResponse& response) {
+				const std::shared_ptr<Impl> self = weak.lock();
+				if (self && !self->stopped_)
+				{
+					self->OnAutomaticAnswer(answered, response, true);
+				}
+			});
+	}
+
+	/** The answer to the automatic redeem (Android) or match (iOS) request. */
+	void OnAutomaticAnswer(bool answered, const HttpResponse& response, bool probabilistic)
+	{
+		if (doneMirror_)
+		{
+			return; // a pasted link was handled meanwhile; this one is dropped
+		}
+		if (!answered || response.statusCode == 429)
+		{
+			SetDeferredStatus(DeferredLinkStatus::Pending);
+			return;
+		}
+		if (response.statusCode == 200)
+		{
+			ResolvedLink link;
+			if (!ParseDeferredBody(response.body, hosts_, probabilistic, link))
+			{
+				StoreDone();
+				SetDeferredStatus(DeferredLinkStatus::Failed);
+				return;
+			}
+			if (normalLinkAccepted_)
+			{
+				StoreDone();
+				SetDeferredStatus(DeferredLinkStatus::Superseded);
+				return;
+			}
+			if (!StoreDone())
+			{
+				// Not remembered, so delivering could happen twice: rather lose the link.
+				SetDeferredStatus(DeferredLinkStatus::Failed);
+				return;
+			}
+			SetDeferredStatus(DeferredLinkStatus::Delivered);
+			DeliverDeferred(link);
+			return;
+		}
+		StoreDone();
+		SetDeferredStatus(
+			response.statusCode >= 400 && response.statusCode < 500 ? DeferredLinkStatus::NotFound : DeferredLinkStatus::Failed);
+	}
+
+	/** Same queue and handler as every link; never the launch link, never an `app_open`. */
+	void DeliverDeferred(const ResolvedLink& link)
+	{
+		if (stopped_)
+		{
+			return;
+		}
+		if (CanDeliver())
+		{
+			const LinkHandler handler = linkHandler_;
+			handler(link);
+		}
+		else
+		{
+			Queued queued;
+			queued.seq = nextSeq_++;
+			queued.link = link;
+			pending_.push_back(std::move(queued));
+		}
+	}
+
+	// --- iOS: a pasted link ---
+
+	void ProcessNextPaste()
+	{
+		while (!stopped_ && !pasteBusy_ && !pasteQueue_.empty())
+		{
+			PasteRequest request = std::move(pasteQueue_.front());
+			pasteQueue_.erase(pasteQueue_.begin());
+			pasteBusy_ = true;
+			pasteDone_ = std::move(request.done);
+			StartPaste(request.text);
+		}
+	}
+
+	void FinishPaste(PastedLinkResult result)
+	{
+		const std::function<void(PastedLinkResult)> done = std::move(pasteDone_);
+		pasteDone_ = nullptr;
+		pasteBusy_ = false;
+		if (done)
+		{
+			done(result);
+		}
+		if (!stopped_)
+		{
+			ProcessNextPaste();
+		}
+	}
+
+	void StartPaste(const std::string& text)
+	{
+		if (!DeferredEffective() || !IsIos())
+		{
+			FinishPaste(PastedLinkResult::Disabled);
+			return;
+		}
+		bool done = doneMirror_;
+		if (!done && !ReadDone(done))
+		{
+			FinishPaste(PastedLinkResult::Failed);
+			return;
+		}
+		if (done)
+		{
+			doneMirror_ = true;
+			FinishPaste(PastedLinkResult::AlreadyHandled);
+			return;
+		}
+		std::string clickId;
+		if (!FindClickIdInPastedLink(text, hosts_, clickId))
+		{
+			// Whatever the person had on the clipboard: dropped here, sent nowhere.
+			if (awaitingPaste_)
+			{
+				awaitingPaste_ = false;
+				ContinueMatching();
+			}
+			FinishPaste(PastedLinkResult::NotOurs);
+			return;
+		}
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		StartPost(
+			BuildDeferredRedeemEndpoint(config_.apiBaseUrl),
+			BuildIosRedeemBody(clickId, config_.iosBundleId, config_.sdkVersion),
+			[weak](bool answered, const HttpResponse& response) {
+				const std::shared_ptr<Impl> self = weak.lock();
+				if (self && !self->stopped_)
+				{
+					self->OnPasteAnswer(answered, response);
+				}
+			});
+	}
+
+	void OnPasteAnswer(bool answered, const HttpResponse& response)
+	{
+		if (!answered || response.statusCode == 429)
+		{
+			// `done` is not stored: the person can tap Paste again.
+			FinishPaste(PastedLinkResult::Failed);
+			return;
+		}
+		if (doneMirror_)
+		{
+			FinishPaste(PastedLinkResult::AlreadyHandled); // the other flow finished meanwhile
+			return;
+		}
+		if (response.statusCode == 200)
+		{
+			ResolvedLink link;
+			if (!ParseDeferredBody(response.body, hosts_, false, link) || !StoreDone())
+			{
+				StoreDone();
+				SetDeferredStatus(DeferredLinkStatus::Failed);
+				FinishPaste(PastedLinkResult::Failed);
+				return;
+			}
+			// Delivered even after a normal link: pasting was the person's own, explicit action.
+			SetDeferredStatus(DeferredLinkStatus::Delivered);
+			DeliverDeferred(link);
+			FinishPaste(PastedLinkResult::Delivered);
+			return;
+		}
+		const bool refused = response.statusCode >= 400 && response.statusCode < 500;
+		StoreDone();
+		SetDeferredStatus(refused ? DeferredLinkStatus::NotFound : DeferredLinkStatus::Failed);
+		FinishPaste(refused ? PastedLinkResult::NotFound : PastedLinkResult::Failed);
+	}
+
+	// --- deferred requests: POST with the timeout and retries of resolving ---
+
+	void StartPost(
+		const std::string& endpoint, const std::string& body, std::function<void(bool, const HttpResponse&)> done)
+	{
+		const std::shared_ptr<PostOp> op = std::make_shared<PostOp>();
+		op->id = nextOpId_++;
+		op->request.method = "POST";
+		op->request.url = endpoint;
+		op->request.headers.emplace_back("Content-Type", "application/json");
+		op->request.headers.emplace_back("Accept", "application/json");
+		op->request.body = body; // built once: every retry sends the identical body
+		op->done = std::move(done);
+		posts_[op->id] = op;
+		StartPostAttempt(op);
+	}
+
+	std::shared_ptr<PostOp> FindPost(std::uint64_t opId, std::uint64_t token) const
+	{
+		const auto found = posts_.find(opId);
+		if (found == posts_.end() || found->second->token != token)
+		{
+			return nullptr;
+		}
+		return found->second;
+	}
+
+	void StartPostAttempt(const std::shared_ptr<PostOp>& op)
+	{
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		const std::uint64_t opId = op->id;
+		const std::uint64_t token = ++op->token;
+
+		op->timerActive = true;
+		op->timerId = scheduler_.Schedule(config_.timeoutMs, [weak, opId, token]() {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (!self || self->stopped_)
+			{
+				return;
+			}
+			const std::shared_ptr<PostOp> waiting = self->FindPost(opId, token);
+			if (!waiting || !waiting->timerActive)
+			{
+				return;
+			}
+			waiting->timerActive = false;
+			if (waiting->httpActive)
+			{
+				waiting->httpActive = false;
+				if (waiting->httpId != 0)
+				{
+					self->transport_.Cancel(waiting->httpId);
+				}
+			}
+			self->RetryPostOrGiveUp(waiting);
+		});
+
+		op->httpActive = true;
+		op->httpId = 0;
+		const std::uint64_t httpId = transport_.Send(op->request, [weak, opId, token](const HttpResponse& response) {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (!self || self->stopped_)
+			{
+				return;
+			}
+			const std::shared_ptr<PostOp> waiting = self->FindPost(opId, token);
+			if (!waiting || !waiting->httpActive)
+			{
+				return;
+			}
+			waiting->httpActive = false;
+			if (waiting->timerActive)
+			{
+				waiting->timerActive = false;
+				self->scheduler_.Cancel(waiting->timerId);
+			}
+			if (!response.transportOk || response.statusCode >= 500)
+			{
+				self->RetryPostOrGiveUp(waiting);
+				return;
+			}
+			self->FinishPost(waiting, true, response);
+		});
+		if (op->token == token && op->httpActive)
+		{
+			op->httpId = httpId;
+		}
+	}
+
+	void RetryPostOrGiveUp(const std::shared_ptr<PostOp>& op)
+	{
+		if (op->retries >= config_.maxRetries)
+		{
+			FinishPost(op, false, HttpResponse());
+			return;
+		}
+		++op->retries;
+		const std::weak_ptr<Impl> weak = weak_from_this();
+		const std::uint64_t opId = op->id;
+		const std::uint64_t token = ++op->token;
+		op->timerActive = true;
+		op->timerId = scheduler_.Schedule(RetryDelayMs(config_.retryDelayMs, op->retries), [weak, opId, token]() {
+			const std::shared_ptr<Impl> self = weak.lock();
+			if (!self || self->stopped_)
+			{
+				return;
+			}
+			const std::shared_ptr<PostOp> waiting = self->FindPost(opId, token);
+			if (waiting && waiting->timerActive)
+			{
+				waiting->timerActive = false;
+				self->StartPostAttempt(waiting);
+			}
+		});
+	}
+
+	void FinishPost(const std::shared_ptr<PostOp>& op, bool answered, const HttpResponse& response)
+	{
+		posts_.erase(op->id);
+		++op->token;
+		const std::function<void(bool, const HttpResponse&)> done = std::move(op->done);
+		op->done = nullptr;
+		if (done)
+		{
+			done(answered, response);
+		}
+	}
+
 	// --- analytics ---
 
 	/** Best effort: never awaited by delivery, every failure is swallowed. */
-	void ReportAppOpen(const std::string& linkId)
+	void ReportAppOpen(const std::string& linkId, const Campaign& campaign)
 	{
 		std::uint8_t bytes[16] = {};
 		if (random_ != nullptr)
@@ -1841,7 +3179,7 @@ private:
 		request.method = "POST";
 		request.url = BuildEventsEndpoint(config_.apiBaseUrl);
 		request.headers.emplace_back("Content-Type", "application/json");
-		request.body = BuildAppOpenBody(FormatUuidV4(bytes), linkId, config_.platform, config_.sdkVersion);
+		request.body = BuildAppOpenBody(FormatUuidV4(bytes), linkId, config_.platform, config_.sdkVersion, campaign);
 
 		const std::weak_ptr<Impl> weak = weak_from_this();
 		const std::uint64_t eventId = nextEventId_++;
@@ -1918,6 +3256,36 @@ private:
 
 	std::vector<std::function<void()>> readyWaiters_;
 	std::vector<InitialLinkCallback> initialWaiters_;
+
+	// Deferred links.
+	bool deferredOption_ = false;
+	DeferredLinkStatus deferredStatus_ = DeferredLinkStatus::Disabled;
+	std::function<void(DeferredLinkStatus)> statusHandler_;
+	std::vector<InstallReferrerSource> sources_;
+	/** True once the check started asking the sources; the list is fixed from then on. */
+	bool sourcesTaken_ = false;
+	bool checkScheduled_ = false;
+	bool checkTimerActive_ = false;
+	std::uint64_t checkTimerId_ = 0;
+	/** A link of this app was accepted from the OS since the engine started. */
+	bool normalLinkAccepted_ = false;
+	/** `done` as this process knows it: set the moment either flow decides to store it. */
+	bool doneMirror_ = false;
+	std::size_t askIndex_ = 0;
+	bool sawReferrer_ = false;
+	bool sawUnavailableForNow_ = false;
+	bool redeemStarted_ = false;
+	bool askingInline_ = false;
+	bool answeredInline_ = false;
+	/** Identifies the one question (source or pasteboard probe) whose answer is still wanted. */
+	std::uint64_t askToken_ = 0;
+	bool askTimerActive_ = false;
+	std::uint64_t askTimerId_ = 0;
+	bool awaitingPaste_ = false;
+	std::vector<PasteRequest> pasteQueue_;
+	bool pasteBusy_ = false;
+	std::function<void(PastedLinkResult)> pasteDone_;
+	std::map<std::uint64_t, std::shared_ptr<PostOp>> posts_;
 };
 
 LinkEngine::LinkEngine(Config config, IHttpTransport& transport, IScheduler& scheduler, IClock& clock, IRandom* random)
@@ -2009,6 +3377,39 @@ bool LinkEngine::IsStrybokUrl(const std::string& url) const
 std::size_t LinkEngine::PendingCount() const
 {
 	return impl_->PendingCount();
+}
+
+DeferredLinkStatus LinkEngine::GetDeferredLinkStatus() const
+{
+	return impl_->GetDeferredLinkStatus();
+}
+
+void LinkEngine::SetDeferredLinkStatusHandler(std::function<void(DeferredLinkStatus)> handler)
+{
+	impl_->SetDeferredLinkStatusHandler(std::move(handler));
+}
+
+void LinkEngine::EnableDeferredLinks()
+{
+	const std::shared_ptr<Impl> keepAlive = impl_;
+	keepAlive->EnableDeferredLinks();
+}
+
+void LinkEngine::SetInstallReferrerSources(std::vector<InstallReferrerSource> sources)
+{
+	impl_->SetInstallReferrerSources(std::move(sources));
+}
+
+void LinkEngine::RedeemPastedLink(const std::string& text, std::function<void(PastedLinkResult)> callback)
+{
+	const std::shared_ptr<Impl> keepAlive = impl_;
+	keepAlive->RedeemPastedLink(text, std::move(callback));
+}
+
+void LinkEngine::SkipPastedLink()
+{
+	const std::shared_ptr<Impl> keepAlive = impl_;
+	keepAlive->SkipPastedLink();
 }
 
 void LinkEngine::Stop()

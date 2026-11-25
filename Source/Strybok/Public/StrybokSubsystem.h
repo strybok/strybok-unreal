@@ -8,6 +8,7 @@
 
 struct FStrybokRuntime;
 struct FStrybokCreateRuntime;
+struct FStrybokDeferredProviders;
 
 /**
  * Entry point of the Strybok SDK.
@@ -162,11 +163,99 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Strybok")
 	void Shutdown();
 
+	// --- Deferred links (optional, off by default): a link tapped before the game was installed ---
+	//
+	// The plugin has no store integration and never reads the pasteboard. Android: the game
+	// registers one or more install referrer sources (AddInstallReferrerSource, C++ only) and sets
+	// the package name. iOS: the game hands over what the player pasted (RedeemPastedLink) and
+	// sets the bundle id. A deferred link arrives through OnLinkReceived like any other, with
+	// bIsDeferred set; GetInitialLink never returns it and no app_open event is sent for it.
+	// Nothing here ever fires OnLinkError.
+
+	/** Where the deferred link check stands. Disabled while the SDK is not configured. */
+	UFUNCTION(BlueprintPure, Category = "Strybok|Deferred links")
+	EStrybokDeferredLinkStatus GetDeferredLinkStatus() const;
+
+	/** Fires on the game thread whenever GetDeferredLinkStatus changes. For diagnostics and QA; do not show it to players. */
+	UPROPERTY(BlueprintAssignable, Category = "Strybok|Deferred links")
+	FStrybokDeferredLinkStatusChanged OnDeferredLinkStatusChanged;
+
+	/** Same as OnDeferredLinkStatusChanged, for C++ lambdas. */
+	FStrybokDeferredLinkStatusChangedNative& OnDeferredLinkStatusChangedNative() { return DeferredLinkStatusChangedNative; }
+
+	/**
+	 * Switches deferred links on after start-up, for example after a consent screen, and runs the
+	 * check once (once the launch link has been handled; never more than once per configuration).
+	 * Called before Configure it is remembered. Calling it again does nothing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Strybok|Deferred links")
+	void EnableDeferredLinks();
+
+	/**
+	 * iOS: hands over the text the player pasted with a paste control or paste action of the game.
+	 * If it is a link of this app with a click id, the id is exchanged for the link once and the
+	 * link is delivered through OnLinkReceived (even if a normal link was delivered before).
+	 * Anything else gives NotOurs: nothing is sent, stored or logged. OnComplete is not called
+	 * when the SDK is shut down or reconfigured while the request is in flight.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Strybok|Deferred links")
+	void RedeemPastedLink(const FString& PastedText, const FStrybokPastedLinkCompleted& OnComplete);
+
+	/** RedeemPastedLink for C++ lambdas. */
+	void RedeemPastedLinkNative(const FString& PastedText, TFunction<void(EStrybokPastedLinkResult /*Result*/)> OnComplete);
+
+	/**
+	 * iOS, only with probabilistic matching and a pasteboard provider: the player moved on without
+	 * pasting, so matching may start (status AwaitingPaste). Does nothing otherwise.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Strybok|Deferred links")
+	void SkipPastedLink();
+
+	/**
+	 * Android: adds an install referrer source of the game; sources are asked in the order added.
+	 * Game thread only. The list is read at the moment the check starts asking, which is one frame
+	 * after the launch link was handled when Deferred Links is on in the settings, or one frame
+	 * after EnableDeferredLinks. So either add the sources in the frame the game instance starts
+	 * (UGameInstance::Init, after Super::Init), or - simpler and safe - leave Deferred Links off in
+	 * the settings and call EnableDeferredLinks after adding them. A source added after the check
+	 * began is not asked in this launch. With no source at all the check ends as Unavailable and is
+	 * not repeated on later launches.
+	 */
+	void AddInstallReferrerSource(FStrybokInstallReferrerSource Source);
+
+	/**
+	 * iOS probabilistic matching: returns "iphone", "ipad" or "ipod" (from the UIKit idiom and
+	 * device model; anything else means "not such a device"). Called on the game thread. Without
+	 * it, or without a locale provider, matching ends as Unavailable.
+	 */
+	void SetDeviceFamilyProvider(TFunction<FString()> Provider);
+
+	/** iOS probabilistic matching: returns the first preferred language as a BCP 47 tag such as "en-GB" (NSLocale.preferredLanguages.firstObject). */
+	void SetLocaleProvider(TFunction<FString()> Provider);
+
+	/**
+	 * iOS probabilistic matching, optional: answers whether the pasteboard probably holds a web
+	 * URL, found out WITHOUT reading it (UIPasteboard detectPatterns with probableWebURL).
+	 * Called on the game thread; Complete may be called from any thread. When it answers true,
+	 * matching waits for RedeemPastedLink or SkipPastedLink.
+	 */
+	void SetPasteboardMayContainLinkProvider(TFunction<void(TFunction<void(bool)> /*Complete*/)> Provider);
+
 private:
 	bool Tick(float DeltaSeconds);
 	bool HasLinkListener() const;
 	void DeliverLink(const FStrybokResolvedLink& Link);
 	void DeliverError(const FStrybokError& Error);
+	void DeliverDeferredLinkStatus(EStrybokDeferredLinkStatus Status);
+	TSharedRef<FStrybokDeferredProviders> GetDeferredProviders();
+
+	/** What the game registered for deferred links; made on first use, kept across configurations. */
+	TSharedPtr<FStrybokDeferredProviders> DeferredProviders;
+
+	/** EnableDeferredLinks was called: later configurations start with deferred links on. */
+	bool bDeferredLinksEnabled = false;
+
+	FStrybokDeferredLinkStatusChangedNative DeferredLinkStatusChangedNative;
 
 	/** The runtime of CreateLink, made on first use. Null with a problem text when the options are unusable. */
 	TSharedPtr<FStrybokCreateRuntime> EnsureCreateRuntime(FString& OutProblem);

@@ -78,8 +78,30 @@ struct LinkError
 };
 
 /**
- * A link resolved by the API. `routePath` and `payloadJson` are untrusted data chosen by whoever
- * created the link: map them onto routes the app already knows.
+ * Campaign values of an opened link (`utm_source`, `utm_medium`, `utm_campaign`, `utm_term`,
+ * `utm_content`): the link's defaults, overridden by the `utm_*` parameters of the tapped URL.
+ * An empty string means "no value" (the service never sends an empty one).
+ *
+ * Untrusted labels: whoever shares a link can write any value into its URL.
+ */
+struct Campaign
+{
+	std::string source;
+	std::string medium;
+	std::string campaign;
+	std::string term;
+	std::string content;
+
+	bool IsEmpty() const
+	{
+		return source.empty() && medium.empty() && campaign.empty() && term.empty() && content.empty();
+	}
+};
+
+/**
+ * A link resolved by the API. `routePath`, `payloadJson` and `campaign` are untrusted data chosen
+ * by whoever created or shared the link: map them onto routes the app already knows, and use
+ * campaign values as labels only.
  */
 struct ResolvedLink
 {
@@ -91,7 +113,108 @@ struct ResolvedLink
 	std::string routePath;
 	/** The `payload` JSON object as text; `{}` when the response had none or it was not an object. */
 	std::string payloadJson = "{}";
+	/** Never missing: `IsEmpty()` when the response had no campaign values. */
+	Campaign campaign;
+	/**
+	 * True when the link was restored after an installation (deferred links) instead of arriving
+	 * from the OS. False for every other link.
+	 */
+	bool isDeferred = false;
+	/**
+	 * True only for a deferred link found by iOS probabilistic matching: a guess from the network
+	 * address that **may be another person's link**. Never sign anyone in, accept an invitation,
+	 * apply a personal discount or show personal content on the strength of such a link alone.
+	 */
+	bool isProbabilisticMatch = false;
 };
+
+// --- deferred links (optional; SDK contract, "Deferred links") ---
+
+/** Where the deferred-link check stands. Nothing about it is ever reported as an error. */
+enum class DeferredLinkStatus
+{
+	/** `deferredLinks` is off, or something it needs is missing (store, platform, app identifier). */
+	Disabled,
+	/** The check is running in this launch. */
+	Checking,
+	/** Not started yet, or this launch could not finish it (store or network not reachable). */
+	Pending,
+	/** The check was finished in an earlier launch. */
+	NotFirstLaunch,
+	/** No source is configured or none can ever answer; on iOS: nothing automatic is switched on. */
+	Unavailable,
+	/** The store returned a referrer without a click id of ours (an ordinary install). */
+	NoReferrer,
+	/** The server refused: unknown, too old, already used, or not this application's. */
+	NotFound,
+	/** A normal link of this app arrived first. */
+	Superseded,
+	/** The link was handed to the delivery pipeline. */
+	Delivered,
+	/** Three launches could not finish the check, or the server's answer was unusable. */
+	Failed,
+	/** iOS matching waits for `RedeemPastedLink` or `SkipPastedLink` (the pasteboard may hold a link). */
+	AwaitingPaste,
+};
+
+/** Result of `LinkEngine::RedeemPastedLink`. */
+enum class PastedLinkResult
+{
+	Delivered,
+	/** Not a link of this app with a click id: nothing was sent, the text was dropped. */
+	NotOurs,
+	NotFound,
+	/** A deferred link was already handled for this installation. */
+	AlreadyHandled,
+	Disabled,
+	/** Temporary (network, 429, server error) unless the status became `Failed`: may be tried again. */
+	Failed,
+};
+
+/** What an install referrer source answers. */
+struct InstallReferrerAnswer
+{
+	enum class Kind
+	{
+		/** `referrer` is the raw string of the store, exactly as returned (it may be empty). */
+		Referrer,
+		/** The store could not be asked; a later launch may succeed. */
+		UnavailableForNow,
+		/** This store is not on the device, is too old, or its library is not in the app. */
+		Unavailable,
+	};
+
+	Kind kind = Kind::Unavailable;
+	std::string referrer;
+};
+
+/**
+ * One store's install referrer, supplied by the app. Called on the engine's thread; it must not
+ * block, and answers by invoking `answer` at most once on the engine's thread, now or later. An
+ * answer later than 10 seconds is treated as "unavailable for now" and ignored.
+ */
+using InstallReferrerSource = std::function<void(std::function<void(const InstallReferrerAnswer&)> answer)>;
+
+/**
+ * Small persistent key-value storage, private to the installation and removed with the app's data.
+ * The engine writes two keys, `strybok.deferred.attempts` and `strybok.deferred.done`, and nothing
+ * else - never the referrer, the pasted text or a click id. It must really persist: a store that
+ * forgets between launches makes the check run again on every launch.
+ */
+class IDeferredLinkStore
+{
+public:
+	virtual ~IDeferredLinkStore();
+
+	/** False when reading failed. `outFound` is false when the key was never written. */
+	virtual bool Read(const std::string& key, std::string& outValue, bool& outFound) = 0;
+
+	/** False when the value could not be stored. */
+	virtual bool Write(const std::string& key, const std::string& value) = 0;
+};
+
+extern const char* const kDeferredAttemptsKey;
+extern const char* const kDeferredDoneKey;
 
 struct Config
 {
@@ -118,6 +241,35 @@ struct Config
 	 * secret. Never put a secret API key (`lb_...`) here.
 	 */
 	std::string clientKey;
+
+	// --- deferred links (optional). Effective only with `deferredLinks`, a store, and platform
+	// `android` with `androidPackageName` or platform `ios` with `iosBundleId`; otherwise the
+	// status is `Disabled` and nothing below is used. ---
+
+	/** Restore a link that was tapped before the app was installed. Off by default. */
+	bool deferredLinks = false;
+	/**
+	 * iOS only, with `deferredLinks`: let the server guess the link from the network address.
+	 * **Forbidden by Apple's rules** (fingerprinting); a match may be another person's link.
+	 */
+	bool allowProbabilisticMatching = false;
+	/** Android: asked in order until one referrer holds a click id. See `SetInstallReferrerSources`. */
+	std::vector<InstallReferrerSource> installReferrerSources;
+	/** Android: the app's own application ID. */
+	std::string androidPackageName;
+	/** iOS: the app's own bundle identifier. */
+	std::string iosBundleId;
+	/** iOS matching: `iphone`, `ipad` or `ipod`; anything else means "not such a device". */
+	std::function<std::string()> deviceFamily;
+	/** iOS matching: the first preferred language as a BCP 47 tag, e.g. `en-GB`; empty when unknown. */
+	std::function<std::string()> locale;
+	/**
+	 * iOS matching, optional: whether the pasteboard probably holds a web URL, found out without
+	 * reading it. Answers through the callback on the engine's thread (10 seconds, then "no").
+	 */
+	std::function<void(std::function<void(bool)> answer)> pasteboardMayContainLink;
+	/** Where `attempts` and `done` are kept. Without one deferred links stay `Disabled`. */
+	std::shared_ptr<IDeferredLinkStore> deferredLinkStore;
 };
 
 /** What `LinkCreator::Create` sends. Only `routePath` is required; an empty string means "not given". */
@@ -223,13 +375,25 @@ std::string ValidateConfig(const Config& config);
 /**
  * Whether `url` is a Strybok link of this app: `https`, host in `normalizedHosts`, no user info,
  * no port or port 443, and a path matching `^/[A-Za-z0-9_-]{1,64}$`. Query and fragment are
- * allowed and ignored. `normalizedHosts` must come from `NormalizeHosts`.
+ * allowed and do not decide anything. `normalizedHosts` must come from `NormalizeHosts`.
  */
 bool IsStrybokUrl(const std::string& url, const std::vector<std::string>& normalizedHosts);
 
 /**
- * `https://{lower-cased host}{path}` for a URL accepted by `IsStrybokUrl`; false otherwise.
- * Query and fragment are never part of the result: they may hold private data.
+ * The campaign query of a lookup URL (SDK contract, "Campaign query"): empty, or `?` followed by
+ * those of the five `utm_*` parameters of `rawQuery` whose first occurrence has a valid value
+ * (1–64 characters of `A–Z a–z 0–9 . _ ~ -` after percent-decoding), as `key=value` joined with
+ * `&` in the fixed order source, medium, campaign, term, content.
+ *
+ * `rawQuery` is a query string without the leading `?` and without the fragment. Any bytes are
+ * accepted: a malformed escape or invalid UTF-8 only drops that value.
+ */
+std::string BuildCampaignQuery(const std::string& rawQuery);
+
+/**
+ * `https://{lower-cased host}{path}` plus `BuildCampaignQuery` of the URL's query, for a URL
+ * accepted by `IsStrybokUrl`; false otherwise. The rest of the query and the fragment are never
+ * part of the result: they may hold private data.
  */
 bool BuildLookupUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, std::string& outLookup);
 
@@ -248,6 +412,8 @@ std::int64_t RetryDelayMs(std::int64_t retryDelayMs, int retryNumber);
 /**
  * Validates a 200 body: a JSON object with string `linkId`, `appId` and `routePath`, where
  * `routePath` starts with `/` but not `//`. Fills `outLink` (with `uri` as given) on success.
+ * `campaign` takes the non-empty string fields `source`, `medium`, `campaign`, `term` and
+ * `content` of the answer's `campaign` object; anything else there is ignored, never an error.
  */
 bool ParseResolveBody(const std::string& uri, const std::string& body, ResolvedLink& outLink);
 
@@ -273,12 +439,73 @@ AttemptResult ClassifyResolveResponse(const std::string& uri, const HttpResponse
 /** RFC 4122 version 4 UUID text from 16 random bytes (version and variant bits are forced). */
 std::string FormatUuidV4(const std::uint8_t bytes[16]);
 
-/** The exact `app_open` event body: `eventId`, `linkId`, `type`, `platform`, `sdkVersion`. */
+/**
+ * The exact `app_open` event body: `eventId`, `linkId`, `type`, `platform`, `sdkVersion`, and
+ * `campaign` (what resolve returned, unchanged) unless it is empty.
+ */
 std::string BuildAppOpenBody(
 	const std::string& eventId,
 	const std::string& linkId,
 	const std::string& platform,
+	const std::string& sdkVersion,
+	const Campaign& campaign = Campaign());
+
+// --- deferred links ---
+
+/** `{apiBaseUrl}/v1/public/deferred-links/redeem`. */
+std::string BuildDeferredRedeemEndpoint(const std::string& apiBaseUrl);
+
+/** `{apiBaseUrl}/v1/public/deferred-links/match`. */
+std::string BuildDeferredMatchEndpoint(const std::string& apiBaseUrl);
+
+/**
+ * The click id in a store's install referrer (SDK contract, "Finding the click id"): the value of
+ * the first `key=value` part whose key is exactly `strybok_click`, if it matches
+ * `^dc_[0-9A-Za-z]{32}$`. Only when no part has that key and the string contains
+ * `strybok_click%3D` (any letter case) is the whole string percent-decoded once and searched
+ * again. Nothing else in the referrer is looked at.
+ */
+bool FindClickIdInReferrer(const std::string& referrer, std::string& outClickId);
+
+/**
+ * The click id of a pasted link: `text`, trimmed, must be a link of this app (`IsStrybokUrl`) and
+ * the first `strybok_click` parameter of its query must match `^dc_[0-9A-Za-z]{32}$`.
+ */
+bool FindClickIdInPastedLink(
+	const std::string& text, const std::vector<std::string>& normalizedHosts, std::string& outClickId);
+
+/** Exactly `{"platform":"android","clickId":...,"packageName":...,"sdkVersion":...}`. */
+std::string BuildAndroidRedeemBody(
+	const std::string& clickId, const std::string& packageName, const std::string& sdkVersion);
+
+/** Exactly `{"platform":"ios","clickId":...,"bundleId":...,"sdkVersion":...}`. */
+std::string BuildIosRedeemBody(
+	const std::string& clickId, const std::string& bundleId, const std::string& sdkVersion);
+
+/** Exactly `{"platform":"ios","bundleId":...,"deviceFamily":...,"locale":...,"sdkVersion":...}`. */
+std::string BuildMatchBody(
+	const std::string& bundleId,
+	const std::string& deviceFamily,
+	const std::string& locale,
 	const std::string& sdkVersion);
+
+/** `iphone`, `ipad` or `ipod`. */
+bool IsMatchDeviceFamily(const std::string& value);
+
+/** `^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{1,8}){0,4}$`, what the match endpoint accepts. */
+bool IsMatchLocale(const std::string& value);
+
+/**
+ * Validates a 200 answer of the redeem or match endpoint: everything `ParseResolveBody` checks,
+ * `deferred` is `true`, `url` is a link of this app and, with `requireProbabilistic`, `matched`
+ * is `"probabilistic"`. Fills `outLink` with `uri` = the answer's `url`, `isDeferred` = true and
+ * `isProbabilisticMatch` = `requireProbabilistic`.
+ */
+bool ParseDeferredBody(
+	const std::string& body,
+	const std::vector<std::string>& normalizedHosts,
+	bool requireProbabilistic,
+	ResolvedLink& outLink);
 
 // --- creating links ---
 
@@ -456,6 +683,45 @@ public:
 
 	/** Number of resolved links waiting for a listener. */
 	std::size_t PendingCount() const;
+
+	// --- deferred links (optional) ---
+	//
+	// The automatic check runs at most once per engine, on a scheduler turn after `Start` became
+	// ready (or after `EnableDeferredLinks`, whichever is later); nothing waits for it. Its result
+	// is a status, never an error. A deferred link is delivered through the link handler like any
+	// other (queued until somebody listens) with `isDeferred` set, is never the launch link of
+	// `GetInitialLink`, and causes no `app_open` event.
+
+	DeferredLinkStatus GetDeferredLinkStatus() const;
+
+	/** Called on every change of the status, on the engine's thread. */
+	void SetDeferredLinkStatusHandler(std::function<void(DeferredLinkStatus)> handler);
+
+	/**
+	 * Switches `deferredLinks` on after construction, for example after a consent screen, and runs
+	 * the check once if `Start` is ready and it has not run in this engine. Calling it again does
+	 * nothing. The status stays `Disabled` while a store, the platform or the app identifier is
+	 * missing.
+	 */
+	void EnableDeferredLinks();
+
+	/**
+	 * Replaces the Android referrer sources. The list is read at the moment the check starts
+	 * asking them, so call it before `Start` or before `EnableDeferredLinks`; later it changes
+	 * nothing.
+	 */
+	void SetInstallReferrerSources(std::vector<InstallReferrerSource> sources);
+
+	/**
+	 * iOS: hands over a string the person pasted (the engine never reads a pasteboard). `callback`
+	 * gets the result, possibly before this returns; it is dropped when the engine is stopped
+	 * while the request is in flight. Calls are handled one after another. The text is never
+	 * stored or logged, and only the click id found in it is sent.
+	 */
+	void RedeemPastedLink(const std::string& text, std::function<void(PastedLinkResult)> callback);
+
+	/** iOS: the person moved on without pasting. Lets matching continue from `AwaitingPaste`. */
+	void SkipPastedLink();
 
 	/**
 	 * Stops everything. Nothing is delivered afterwards, including links that were still

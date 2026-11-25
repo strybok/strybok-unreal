@@ -8,7 +8,7 @@ It is the Unreal implementation of the [SDK contract](./sdk-contract.md).
 >
 > - **Tested:** the engine-independent core (URL validation, lookup URL, retry and back-off,
 >   response validation, duplicate protection, queue and exactly-once delivery, event body,
->   creating links). It is
+>   campaign values, creating links). It is
 >   plain C++ and has its own test suite that runs without the engine
 >   (`Tests/run_core_tests.sh` in the plugin directory).
 > - **Not tested:** the Unreal module around it (subsystem, HTTP, timers, Project Settings, the
@@ -17,8 +17,11 @@ It is the Unreal implementation of the [SDK contract](./sdk-contract.md).
 >   never run on a device**. Expect to fix compile errors on first use and please report them.
 >   Known gaps are listed [at the end](#known-gaps).
 >
-> Deferred deep linking is **not supported**: a link tapped before the game is installed is not
-> restored after installation.
+> A link tapped before the game is installed is **not restored by default**. Since 0.3.0 the
+> plugin has the optional, off-by-default [deferred links](#deferred-links-optional) of the SDK
+> contract — but it ships **no store integration and never reads the clipboard**: on Android your
+> game must supply the store's install referrer through its own native code, on iOS the player
+> must paste the link. Only the logic in the core is tested; nothing of it has run on a device.
 
 ## 1. Prerequisites
 
@@ -88,6 +91,10 @@ LinkHost=my-app.strybok.link
 | `DedupeWindowSeconds`    | `2`                       | The identical URL received again within this window is dropped.                              |
 | `bReportAppOpens`        | `True`                    | Send a best-effort `app_open` event after a link was resolved.                               |
 | `ClientKey`              | empty                     | Publishable key `pk_…`, only for creating links to share (section 6).                        |
+
+Four more settings belong to [deferred links](#deferred-links-optional) and do nothing unless you
+switch the first one on: `bDeferredLinks` (`False`), `bAllowProbabilisticMatching` (`False`),
+`AndroidPackageName` and `IosBundleId` (empty).
 
 While `LinkHost` is empty the SDK stays idle (one log line, no error). To choose the values at
 runtime instead, turn `bAutoConfigure` off and call `Configure` yourself (section 6).
@@ -325,22 +332,25 @@ Strybok->Configure(Config); // false + a log line when the values are unusable
 
 ### API
 
-| Member                                                                           | Purpose                                                                                                |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `Configure(Config)`                                                              | Start with explicit options. Calling it again replaces the configuration.                              |
-| `ConfigureFromSettings()`                                                        | Start with the Project Settings values (done automatically with `bAutoConfigure`).                     |
-| `IsConfigured()` / `IsReady()`                                                   | Configured; and whether the launch link has been handled.                                              |
-| `OnLinkReceived`                                                                 | Multicast delegate with `FStrybokResolvedLink` (`Uri`, `LinkId`, `AppId`, `RoutePath`, `PayloadJson`). |
-| `OnLinkError`                                                                    | Multicast delegate with `FStrybokError` (`Kind`, `Message`, `Url`, `StatusCode`).                      |
-| `GetInitialLink(OnComplete)`                                                     | The launch link, if not delivered through `OnLinkReceived` yet. Completes after it was resolved.       |
-| `TryGetInitialLink(OutLink)`                                                     | Synchronous variant; `false` while not resolved yet.                                                   |
-| `ResolveUrl(Url, OnComplete)`                                                    | Resolve a URL explicitly (QR scanner, tests). Does not fire `OnLinkReceived` or report an app open.    |
-| `HandleUrl(Url)`                                                                 | Manual entry point: same flow as a link from the OS. Buffered when called before `Configure`.          |
-| `IsStrybokUrl(Url)`                                                              | Whether a URL is one of this app's links.                                                              |
-| `CreateLink(Request, OnComplete)` / `CreateLinkNative(Request, Lambda)`          | Create a short link to share, see [below](#create-a-link-to-share).                                    |
-| `Shutdown()`                                                                     | Stop: nothing is delivered afterwards. Automatic when the game instance ends.                          |
-| `OnLinkReceivedNative()` / `OnLinkErrorNative()`                                 | C++ delegates for lambdas; the same stream.                                                            |
-| `FStrybokResolvedLink::GetPayloadString`, `GetPayloadObject`, `GetRouteSegments` | Helpers; `UStrybokBlueprintLibrary` exposes two of them to Blueprint.                                  |
+| Member                                                                                                            | Purpose                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `Configure(Config)`                                                                                               | Start with explicit options. Calling it again replaces the configuration.                                          |
+| `ConfigureFromSettings()`                                                                                         | Start with the Project Settings values (done automatically with `bAutoConfigure`).                                 |
+| `IsConfigured()` / `IsReady()`                                                                                    | Configured; and whether the launch link has been handled.                                                          |
+| `OnLinkReceived`                                                                                                  | Multicast delegate with `FStrybokResolvedLink` (`Uri`, `LinkId`, `AppId`, `RoutePath`, `PayloadJson`, `Campaign`). |
+| `OnLinkError`                                                                                                     | Multicast delegate with `FStrybokError` (`Kind`, `Message`, `Url`, `StatusCode`).                                  |
+| `GetInitialLink(OnComplete)`                                                                                      | The launch link, if not delivered through `OnLinkReceived` yet. Completes after it was resolved.                   |
+| `TryGetInitialLink(OutLink)`                                                                                      | Synchronous variant; `false` while not resolved yet.                                                               |
+| `ResolveUrl(Url, OnComplete)`                                                                                     | Resolve a URL explicitly (QR scanner, tests). Does not fire `OnLinkReceived` or report an app open.                |
+| `HandleUrl(Url)`                                                                                                  | Manual entry point: same flow as a link from the OS. Buffered when called before `Configure`.                      |
+| `IsStrybokUrl(Url)`                                                                                               | Whether a URL is one of this app's links.                                                                          |
+| `CreateLink(Request, OnComplete)` / `CreateLinkNative(Request, Lambda)`                                           | Create a short link to share, see [below](#create-a-link-to-share).                                                |
+| `Shutdown()`                                                                                                      | Stop: nothing is delivered afterwards. Automatic when the game instance ends.                                      |
+| `GetDeferredLinkStatus()`, `OnDeferredLinkStatusChanged`, `EnableDeferredLinks()`                                 | [Deferred links](#deferred-links-optional): status, and switching them on after start-up.                          |
+| `RedeemPastedLink(Text, OnComplete)` / `RedeemPastedLinkNative`, `SkipPastedLink()`                               | Deferred links on iOS: hand over what the player pasted.                                                           |
+| `AddInstallReferrerSource`, `SetDeviceFamilyProvider`, `SetLocaleProvider`, `SetPasteboardMayContainLinkProvider` | C++ only: what your game supplies for deferred links.                                                              |
+| `OnLinkReceivedNative()` / `OnLinkErrorNative()`                                                                  | C++ delegates for lambdas; the same stream.                                                                        |
+| `FStrybokResolvedLink::GetPayloadString`, `GetPayloadObject`, `GetRouteSegments`                                  | Helpers; `UStrybokBlueprintLibrary` exposes two of them to Blueprint, plus **Has Campaign**.                       |
 
 Use **either** `OnLinkReceived` **or** `GetInitialLink` for start-up navigation. Both are safe
 together (the link is handed out once), but a bound `OnLinkReceived` normally gets the launch link
@@ -402,6 +412,230 @@ Errors never contain the client key or the payload. `Shutdown`, a new `Configure
 the game instance abandon requests in flight; their `OnComplete` is not called. Do not put
 personal data in a route or payload: whoever receives the link can read them.
 
+### Deferred links (optional)
+
+A person taps a link, does not have the game, installs it and opens it: with deferred links the
+game can still receive that link. It is **off by default**, works very differently on the two
+platforms, and has real costs on iOS. The rules the plugin follows are in the SDK contract
+([Android](./sdk-contract.md#deferred-links-optional-android),
+[iOS](./sdk-contract.md#deferred-links-on-ios-optional)); the server side, the dashboard
+switches and what each option costs your users are in the [Android](./android.md) and
+[iOS](./ios.md) guides ("Links tapped before the app is installed"). Read those first.
+
+**What the plugin does and does not do.** The core implements the whole flow: counting attempts,
+finding the click id, the redeem and match requests, "a normal link wins", delivery exactly once.
+The plugin ships **no store integration of its own, no JNI for it and no pasteboard code**:
+
+- **Android:** your game supplies the store's install referrer string through an _install
+  referrer source_ — a C++ function you register, backed by your own Java and JNI code.
+- **iOS:** your game supplies the text the player pasted, from a paste control of your own.
+- Like the rest of the Unreal module, this glue has **not been compiled with Unreal Build Tool**.
+  **Nothing has been tried on a device**, and the Huawei AppGallery and Samsung Galaxy Store
+  flows are unverified even in the native Android SDK.
+
+A deferred link arrives through `OnLinkReceived` like any other link (queued until something is
+bound), with `bIsDeferred = true` and `Uri` set to the link's own URL. `GetInitialLink` never
+returns it — it can arrive seconds after the first screen — and no `app_open` event is sent for
+it. If a normal link opens the game before the deferred one is ready, the deferred one is dropped
+(one launch, one navigation). Nothing about deferred links ever fires `OnLinkError`.
+
+#### Settings
+
+| Setting                       | Default | Meaning                                                                                                                                |
+| ----------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `bDeferredLinks`              | `False` | Run the check after start-up. With `False` nothing of this section happens: no source is asked, no request is made, nothing is stored. |
+| `AndroidPackageName`          | empty   | Your Android application ID. Required on Android; the plugin does not read it from the platform.                                       |
+| `IosBundleId`                 | empty   | Your iOS bundle identifier. Required on iOS.                                                                                           |
+| `bAllowProbabilisticMatching` | `False` | iOS only. **Forbidden by Apple's rules**, see [below](#ios-option-b-probabilistic-matching-not-recommended).                           |
+
+The same four fields exist in `FStrybokConfig`. Without the identifier of the platform the game
+runs on — and in the editor and on every other platform — the status stays `Disabled` and
+nothing is asked, sent or stored.
+
+Reading the install referrer is access to information stored on the device, and whether you need
+the player's consent first is yours to decide. To ask first, leave `bDeferredLinks` off and call
+`EnableDeferredLinks()` after the consent screen: it runs the check once.
+
+The plugin keeps two values per installation, `attempts` and `done`, in
+`Saved/Strybok/DeferredLinks.txt` — never the referrer, the pasted text or a click id. The file
+goes away with the game's data. If a device backup restores it into a fresh installation, the
+check reports `NotFirstLaunch`: a link can be lost that way, never delivered twice.
+
+#### Android: supply the install referrer
+
+Register a source before the check starts asking. The dependable order is: leave `bDeferredLinks`
+off in the settings, register, then enable.
+
+```cpp
+void UMyGameInstance::Init()
+{
+	Super::Init();
+	UStrybokSubsystem* Strybok = GetSubsystem<UStrybokSubsystem>();
+
+#if PLATFORM_ANDROID
+	Strybok->AddInstallReferrerSource([](TFunction<void(const FStrybokInstallReferrerAnswer&)> Complete)
+	{
+		// YOUR code: start the store's asynchronous call and return at once. Call Complete
+		// exactly once, from any thread, when the store has answered.
+		MyGame::RequestPlayInstallReferrer(MoveTemp(Complete));
+	});
+#endif
+	Strybok->EnableDeferredLinks(); // or later, after a consent screen
+}
+```
+
+(With `bDeferredLinks=True` in the settings the check starts one frame after the launch link was
+handled, so sources must then be registered in `Init` as above, right after `Super::Init()`. A
+source added after the check began is not asked in that launch. With no source at all the check
+ends as `Unavailable` and is **not repeated** on later launches.)
+
+`MyGame::RequestPlayInstallReferrer` is yours to write; the plugin cannot do it for you without
+adding a Google dependency to every build. What it has to do, for Google Play:
+
+1. Add `com.android.installreferrer:installreferrer:2.2` (Google's Maven repository) to the
+   Gradle build, for example with a UPL file of your game (`<buildGradleAdditions>`).
+2. In Java: `InstallReferrerClient.newBuilder(context).build()`, then
+   `startConnection(InstallReferrerStateListener)`.
+3. In `onInstallReferrerSetupFinished(int responseCode)` map the result exactly like this, then
+   always call `endConnection()`:
+
+   | Result                                                                                                              | Answer                                                                                                          |
+   | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+   | `OK` (0)                                                                                                            | `FStrybokInstallReferrerAnswer::MakeReferrer(…)` with `getInstallReferrer().getInstallReferrer()`, as it stands |
+   | `SERVICE_UNAVAILABLE` (1), `SERVICE_DISCONNECTED` (-1), a `RemoteException`, `onInstallReferrerServiceDisconnected` | `MakeUnavailableForNow()` — a later launch tries again                                                          |
+   | `FEATURE_NOT_SUPPORTED` (2), `DEVELOPER_ERROR` (3), the library is missing                                          | `MakeUnavailable()`                                                                                             |
+
+4. Hand the answer to C++ through a JNI native method of your own and call `Complete` there.
+
+Pass the referrer string through unchanged and do not log it. The plugin takes only its own
+`strybok_click` value out of it, sends that value, your package name and the SDK version to
+`POST /v1/public/deferred-links/redeem`, and forgets the rest. A source that has not answered
+after 10 seconds counts as "unavailable for now". The check runs at most three times in the life
+of an installation.
+
+Other stores: register one source per store, in the order they should be asked (a store that did
+not install the game simply has no click id, and the next source is asked). The contract
+describes Samsung's `InstallReferrerClient`
+(`store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer:4.0.0`, same shape and
+codes) and Huawei's content provider (`content://com.huawei.appmarket.commondata/item/5`, column 5) — both **unverified**: nobody has confirmed that those stores hand our value back. Huawei also
+requires the user's consent before its provider is queried.
+
+It only works when the owner switched "restore the link after install" on for the application,
+the installation went through the store app from the page the link opened, within 24 hours of the
+tap, and once.
+
+#### iOS option A: the player pastes the link
+
+Needs the owner setting `iosDeferredClipboard`. Visitors without the game then see a page with a
+"Copy link and get the app" button before the App Store. In the game, the player pastes:
+
+```cpp
+// Called by YOUR paste control with the text the player pasted.
+void UMyOnboarding::OnPasted(const FString& PastedText)
+{
+	UStrybokSubsystem* Strybok = GetGameInstance()->GetSubsystem<UStrybokSubsystem>();
+	Strybok->RedeemPastedLinkNative(PastedText, [](EStrybokPastedLinkResult Result)
+	{
+		// Delivered: the link arrives through OnLinkReceived.
+		// NotOurs: the clipboard held something else. Failed: let the player try again.
+	});
+}
+```
+
+Blueprint: **Redeem Pasted Link**.
+
+- **The plugin never reads the pasteboard** and has no paste button. Unreal's UI cannot show
+  Apple's `UIPasteControl` (the system paste button of iOS 16 and later, which pastes without the
+  "Allow Paste" alert); you have to add it as a native view from your own Objective-C++ code, or
+  use a paste action of your own, and hand the resulting string to `RedeemPastedLink`. Do not
+  paste automatically: reading the pasteboard without the player's action shows a system alert
+  and is exactly what this design avoids.
+- Text that is not a link of your app with a valid code gives `NotOurs`: nothing is sent, stored
+  or logged. Otherwise only the click id, your bundle id and the SDK version are sent.
+- A pasted link is delivered even if a normal link was already delivered in this launch.
+- Put the control on the first screen or in onboarding with a sentence that says what it does,
+  and describe it in your App Review notes.
+
+What it costs: **every** iOS visitor without the game gets one extra page and one extra tap
+before the App Store; it works only if the person taps the copy button there **and** later taps
+Paste in the game; it replaces what was on their clipboard; the code works once, for 24 hours.
+Nobody publishes how many people complete this. Details: [iOS guide](./ios.md).
+
+#### iOS option B: probabilistic matching (not recommended)
+
+Needs the owner setting `iosDeferredMatching`, the per-link opt-in `allowProbabilisticMatch`
+(links the game creates itself can never have it), **and** `bAllowProbabilisticMatching` in the
+game. On the first launch the plugin then sends your bundle id, the device family and the first
+preferred language to `POST /v1/public/deferred-links/match`, and the server compares the
+connection's IP address with recent taps.
+
+Read this before switching it on:
+
+- **Apple forbids it.** It is fingerprinting in the sense of the App Store Review Guidelines and
+  the Developer Program License Agreement, with or without the player's consent. The App Review
+  and legal risk is the app owner's — yours — not Strybok's.
+- **A match can be another person's link.** On a shared network (home or office Wi-Fi, a
+  university, a mobile carrier) the first person to open the game gets the link. So
+  **`bIsProbabilisticMatch` must be checked**: such a link must never by itself sign anyone in,
+  accept an invitation, apply a personal discount or show personal content.
+- **It often does not work at all:** with iCloud Private Relay or a VPN, or after a change of
+  network, the browser and the game arrive from different addresses and nothing matches.
+- **Privacy:** it makes Strybok process the player's IP address for your application. Your
+  privacy policy and your App Store privacy labels must cover that, and consent may be required.
+  This is not legal advice.
+- **Accuracy is unknown** and cannot be measured: the counters show how often the server found
+  nothing, not how often a match was wrong.
+
+The plugin does not read the device family or the language itself. Supply both, or matching ends
+as `Unavailable`:
+
+```cpp
+#if PLATFORM_IOS
+Strybok->SetDeviceFamilyProvider([]() { return MyGame::IosDeviceFamily(); });   // "iphone", "ipad" or "ipod"
+Strybok->SetLocaleProvider([]() { return MyGame::IosFirstPreferredLanguage(); }); // e.g. "en-GB"
+#endif
+```
+
+In your Objective-C++ code: the family comes from `UIDevice.currentDevice.userInterfaceIdiom`
+(`.phone` → `iphone`, or `ipod` when `UIDevice.currentDevice.model` starts with `iPod`; `.pad` →
+`ipad`; anything else → return an empty string) and the language is
+`NSLocale.preferredLanguages.firstObject`. Send nothing else; the server refuses any other field.
+
+If option A is on as well, the pasted link should win over the guess. For that, optionally supply
+`SetPasteboardMayContainLinkProvider`, implemented with
+`UIPasteboard.generalPasteboard detectPatternsForPatterns:` and
+`UIPasteboardDetectionPatternProbableWebURL` — the call Apple documents as not notifying the user;
+it never reads the content. When it answers `true` the status becomes `AwaitingPaste` and matching
+waits until `RedeemPastedLink` returns `NotOurs` or you call `SkipPastedLink()` (the player moved
+on without pasting).
+
+#### Status
+
+`GetDeferredLinkStatus()` and the delegate `OnDeferredLinkStatusChanged` (C++:
+`OnDeferredLinkStatusChangedNative()`) are for you and your QA, not for players — most people who
+install a game never tapped a link, so finding nothing is the normal result.
+
+| `EStrybokDeferredLinkStatus` | Meaning                                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `Disabled`                   | Off, not configured, not Android or iOS, or the package name / bundle id is missing                     |
+| `Pending`                    | Not started yet, or this launch could not finish (store or network not reachable); a later launch tries |
+| `Checking`                   | Running                                                                                                 |
+| `NotFirstLaunch`             | Finished in an earlier launch                                                                           |
+| `Unavailable`                | Android: no source, or none can ever answer. iOS: nothing automatic is on (pasting still works)         |
+| `NoReferrer`                 | The store's referrer has no click id of ours: an ordinary install                                       |
+| `NotFound`                   | The server refused: unknown, too old, already used, or not this application's                           |
+| `Superseded`                 | A normal link arrived first                                                                             |
+| `Delivered`                  | Handed to `OnLinkReceived`                                                                              |
+| `Failed`                     | Three launches could not finish, or the server's answer was unusable                                    |
+| `AwaitingPaste`              | iOS matching waits for `RedeemPastedLink` or `SkipPastedLink`                                           |
+
+`RedeemPastedLink` completes with `Delivered`, `NotOurs`, `NotFound`, `AlreadyHandled`,
+`Disabled` or `Failed`. The status is written to `LogStrybok` at `Verbose`; the referrer, the
+pasted text and the click id are never logged.
+
+Calling `Configure` again starts a fresh check for the new configuration; if the earlier one had
+not finished, that uses up another of the three attempts.
+
 ## 7. Errors
 
 `ResolveUrl` completes with, and `OnLinkError` receives, an `FStrybokError`:
@@ -436,8 +670,60 @@ After a link is resolved the SDK sends one best-effort `app_open` event
 (`ios`/`android`, `unknown` in the editor) and the SDK version — no device identifiers. It never
 delays delivery and all failures are ignored. Disable it with `bReportAppOpens=False`.
 
-Only the link's host and slug are sent to `resolve`; query parameters and fragments stay on the
-device.
+Only the link's host and slug are sent to `resolve`, plus the five `utm_*` campaign parameters of
+the tapped URL when they are valid (see below); every other query parameter and the fragment
+stay on the device.
+
+With [deferred links](#deferred-links-optional) switched on — they are off by default — the
+plugin additionally sends, at most a few times per installation: on Android the click id found
+in the install referrer your game supplied, the package name and the SDK version; on iOS the
+click id of a pasted link, the bundle id and the SDK version. Only iOS probabilistic matching
+(`bAllowProbabilisticMatching`, off by default and forbidden by Apple) goes further: it sends the
+bundle id, device family and first preferred language, and the server uses the connection's IP
+address to identify the device.
+
+### Campaign values
+
+A resolved link has `Campaign` (`FStrybokCampaign`): the `utm_source`, `utm_medium`,
+`utm_campaign`, `utm_term` and `utm_content` of this open as the strings `Source`, `Medium`,
+`Campaign`, `Term` and `Content`. A value that is not set is an **empty string**;
+`Link.Campaign.IsEmpty()` (Blueprint: **Has Campaign** on the link) tells whether there is any.
+In Blueprint, **Break Strybok Resolved Link** → **Break Strybok Campaign** gives the five strings.
+
+```cpp
+void UMyGameInstance::HandleLink(const FStrybokResolvedLink& Link)
+{
+	if (!Link.Campaign.Source.IsEmpty())
+	{
+		MyAnalytics::SetLabel(TEXT("link_source"), Link.Campaign.Source); // a label, nothing more
+	}
+	// ... navigate by Link.RoutePath as before
+}
+```
+
+The query filter, the parsing of the answer and the event body are part of the tested core; the
+`FStrybokCampaign` struct and its conversion belong to the Unreal module and are, like the rest of
+it, not compiled against the engine yet.
+
+- **Where the values come from.** The link's defaults — set in the dashboard (link form →
+  "Campaign (optional)") or through the management API — with the `utm_*` parameters of the
+  tapped URL on top, key by key. `https://my-app.strybok.link/invite777?utm_source=instagram`
+  opens with source `instagram` whatever the default is; a link tapped without parameters gives
+  the defaults. A URL can replace a default but cannot clear it.
+- **Untrusted labels.** Whoever shares a link can write any `utm_*` value into its URL. Use the
+  values as labels for your own analytics; never decide access, prices, rewards or navigation by
+  them.
+- **What is accepted.** Only these five lower-case names, and only values of 1–64 characters
+  out of `A–Z a–z 0–9 . _ ~ -`. Anything else (`spring sale`, an e-mail address, non-Latin
+  letters) is dropped silently, as if the parameter were absent — by the SDK and again by the
+  server.
+- **What is sent.** With the resolve request the SDK sends those five parameters when they are
+  valid, and nothing else of the query and never the fragment. With the `app_open` event it
+  reports the values exactly as resolve returned them. The dashboard's link analytics then
+  shows a "Campaigns" breakdown by source, medium and campaign, with app opens and browser opens
+  counted separately (term and content are not broken down).
+- **Versions.** New in 0.3.0. Older versions send no query: their links carry no `campaign` and
+  their app opens are counted under the link's defaults.
 
 ## 11. Testing
 
@@ -493,4 +779,10 @@ Tests/run_core_tests.sh /tmp/out   # or into a directory of your choice
   without unbinding can still count as a listener until the engine cleans it up.
 - **Engine HTTP timeouts** shorter than `TimeoutSeconds` surface as `Network` (retried) rather than
   `Timeout`.
+- **Deferred links:** the plugin has no store integration, no JNI for the install referrer and no
+  paste control; the game supplies all three (see
+  [Deferred links](#deferred-links-optional)). The flow itself is covered by the core's tests;
+  the glue in the module (`FStrybokDeferredFileStore`, the provider wrappers, the subsystem
+  functions) is as uncompiled as the rest, and nothing was tried on a device or against a real
+  store. Shipped referrer sources may follow later.
 - **No automation tests inside the engine** and no example project yet.

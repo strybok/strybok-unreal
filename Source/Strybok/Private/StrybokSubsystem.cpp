@@ -1,5 +1,6 @@
 #include "StrybokSubsystem.h"
 
+#include "Async/Async.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
@@ -59,13 +60,59 @@ bool UStrybokSubsystem::Configure(const FStrybokConfig& Config)
 {
 	check(IsInGameThread());
 
-	const strybok::Config CoreConfig = StrybokConvert::ToCoreConfig(Config);
+	strybok::Config CoreConfig = StrybokConvert::ToCoreConfig(Config);
 	const std::string Problem = strybok::ValidateConfig(CoreConfig);
 	if (!Problem.empty())
 	{
 		UE_LOG(LogStrybok, Error, TEXT("Strybok configuration rejected: %s"), *StrybokConvert::ToFString(Problem));
 		return false;
 	}
+
+	// Deferred links (optional). Everything the core cannot know comes from the game: the install
+	// referrer sources, the device family, the locale and the pasteboard hint. The providers are
+	// looked up when the core asks, so they may be registered after this call. The core uses none
+	// of it, and never touches the store, while deferred links are off.
+	const TSharedRef<FStrybokDeferredProviders> Providers = GetDeferredProviders();
+	CoreConfig.deferredLinks = CoreConfig.deferredLinks || bDeferredLinksEnabled;
+	CoreConfig.deferredLinkStore = std::make_shared<FStrybokDeferredFileStore>();
+	for (const FStrybokInstallReferrerSource& Source : Providers->Sources)
+	{
+		CoreConfig.installReferrerSources.push_back(StrybokConvert::ToCoreSource(Source));
+	}
+	CoreConfig.deviceFamily = [Providers]() -> std::string
+	{
+		return Providers->DeviceFamily ? StrybokConvert::ToStd(Providers->DeviceFamily().TrimStartAndEnd().ToLower()) : std::string();
+	};
+	CoreConfig.locale = [Providers]() -> std::string
+	{
+		return Providers->Locale ? StrybokConvert::ToStd(Providers->Locale().TrimStartAndEnd()) : std::string();
+	};
+	CoreConfig.pasteboardMayContainLink = [Providers](std::function<void(bool)> Answer)
+	{
+		if (!Providers->PasteboardMayContainLink)
+		{
+			Answer(false); // no hint from the game: this step is skipped
+			return;
+		}
+		// Boxed: engine closures are relocated with memcpy, which std::function does not survive.
+		const TSharedRef<std::function<void(bool)>, ESPMode::ThreadSafe> BoxedAnswer =
+			MakeShared<std::function<void(bool)>, ESPMode::ThreadSafe>(std::move(Answer));
+		const TFunction<void(TFunction<void(bool)>)> Provider = Providers->PasteboardMayContainLink;
+		Provider([BoxedAnswer](bool bMayContainLink)
+		{
+			if (IsInGameThread())
+			{
+				(*BoxedAnswer)(bMayContainLink);
+			}
+			else
+			{
+				AsyncTask(ENamedThreads::GameThread, [BoxedAnswer, bMayContainLink]()
+				{
+					(*BoxedAnswer)(bMayContainLink);
+				});
+			}
+		});
+	};
 
 	// Replace a previous configuration. The old runtime stays alive until the end of this
 	// function, in case we are being called from one of its callbacks.
@@ -102,6 +149,13 @@ bool UStrybokSubsystem::Configure(const FStrybokConfig& Config)
 		return Self != nullptr && Self->HasLinkListener();
 	});
 	Engine.SetListening(HasLinkListener());
+	Engine.SetDeferredLinkStatusHandler([WeakThis](strybok::DeferredLinkStatus Status)
+	{
+		if (UStrybokSubsystem* Self = WeakThis.Get())
+		{
+			Self->DeliverDeferredLinkStatus(StrybokConvert::ToStatus(Status));
+		}
+	});
 
 	Runtime = NewRuntime;
 
@@ -400,6 +454,124 @@ void UStrybokSubsystem::DeliverLink(const FStrybokResolvedLink& Link)
 	UE_LOG(LogStrybok, Verbose, TEXT("Strybok link %s -> %s"), *Link.LinkId, *Link.RoutePath);
 	OnLinkReceived.Broadcast(Link);
 	LinkReceivedNative.Broadcast(Link);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deferred links
+// ---------------------------------------------------------------------------------------------
+
+TSharedRef<FStrybokDeferredProviders> UStrybokSubsystem::GetDeferredProviders()
+{
+	if (!DeferredProviders.IsValid())
+	{
+		DeferredProviders = MakeShared<FStrybokDeferredProviders>();
+	}
+	return DeferredProviders.ToSharedRef();
+}
+
+EStrybokDeferredLinkStatus UStrybokSubsystem::GetDeferredLinkStatus() const
+{
+	return IsConfigured() ? StrybokConvert::ToStatus(Runtime->Engine->GetDeferredLinkStatus()) : EStrybokDeferredLinkStatus::Disabled;
+}
+
+void UStrybokSubsystem::EnableDeferredLinks()
+{
+	check(IsInGameThread());
+	bDeferredLinksEnabled = true; // also for a later Configure
+	if (IsConfigured())
+	{
+		const TSharedPtr<FStrybokRuntime> KeepAlive = Runtime;
+		KeepAlive->Engine->EnableDeferredLinks();
+	}
+}
+
+void UStrybokSubsystem::RedeemPastedLink(const FString& PastedText, const FStrybokPastedLinkCompleted& OnComplete)
+{
+	const FStrybokPastedLinkCompleted Callback = OnComplete;
+	RedeemPastedLinkNative(PastedText, [Callback](EStrybokPastedLinkResult Result)
+	{
+		Callback.ExecuteIfBound(Result);
+	});
+}
+
+void UStrybokSubsystem::RedeemPastedLinkNative(const FString& PastedText, TFunction<void(EStrybokPastedLinkResult)> OnComplete)
+{
+	check(IsInGameThread());
+	if (!IsConfigured())
+	{
+		if (OnComplete)
+		{
+			OnComplete(EStrybokPastedLinkResult::Disabled);
+		}
+		return;
+	}
+	// The text goes to the core as it is and is never logged: it is whatever the player had on
+	// the clipboard.
+	const TSharedPtr<FStrybokRuntime> KeepAlive = Runtime;
+	KeepAlive->Engine->RedeemPastedLink(StrybokConvert::ToStd(PastedText), [OnComplete](strybok::PastedLinkResult Result)
+	{
+		if (OnComplete)
+		{
+			OnComplete(StrybokConvert::ToPastedResult(Result));
+		}
+	});
+}
+
+void UStrybokSubsystem::SkipPastedLink()
+{
+	check(IsInGameThread());
+	if (IsConfigured())
+	{
+		const TSharedPtr<FStrybokRuntime> KeepAlive = Runtime;
+		KeepAlive->Engine->SkipPastedLink();
+	}
+}
+
+void UStrybokSubsystem::AddInstallReferrerSource(FStrybokInstallReferrerSource Source)
+{
+	check(IsInGameThread());
+	if (!Source)
+	{
+		return;
+	}
+	const TSharedRef<FStrybokDeferredProviders> Providers = GetDeferredProviders();
+	Providers->Sources.push_back(MoveTemp(Source));
+	if (IsConfigured())
+	{
+		// The core takes the list when the check starts asking; after that this changes nothing.
+		std::vector<strybok::InstallReferrerSource> Sources;
+		for (const FStrybokInstallReferrerSource& Registered : Providers->Sources)
+		{
+			Sources.push_back(StrybokConvert::ToCoreSource(Registered));
+		}
+		Runtime->Engine->SetInstallReferrerSources(std::move(Sources));
+	}
+}
+
+void UStrybokSubsystem::SetDeviceFamilyProvider(TFunction<FString()> Provider)
+{
+	check(IsInGameThread());
+	GetDeferredProviders()->DeviceFamily = MoveTemp(Provider);
+}
+
+void UStrybokSubsystem::SetLocaleProvider(TFunction<FString()> Provider)
+{
+	check(IsInGameThread());
+	GetDeferredProviders()->Locale = MoveTemp(Provider);
+}
+
+void UStrybokSubsystem::SetPasteboardMayContainLinkProvider(TFunction<void(TFunction<void(bool)>)> Provider)
+{
+	check(IsInGameThread());
+	GetDeferredProviders()->PasteboardMayContainLink = MoveTemp(Provider);
+}
+
+void UStrybokSubsystem::DeliverDeferredLinkStatus(EStrybokDeferredLinkStatus Status)
+{
+	// Only the status is logged, never a referrer, a pasted text or a click id.
+	UE_LOG(LogStrybok, Verbose, TEXT("Strybok deferred link status: %d"), static_cast<int32>(Status));
+	OnDeferredLinkStatusChanged.Broadcast(Status);
+	DeferredLinkStatusChangedNative.Broadcast(Status);
 }
 
 void UStrybokSubsystem::DeliverError(const FStrybokError& Error)

@@ -1,8 +1,11 @@
 #include "StrybokRuntime.h"
 
 #include "Async/Async.h"
+#include "HAL/FileManager.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 
 // ---------------------------------------------------------------------------------------------
 // Conversions
@@ -26,7 +29,113 @@ FStrybokResolvedLink StrybokConvert::ToLink(const strybok::ResolvedLink& Link)
 	Result.AppId = ToFString(Link.appId);
 	Result.RoutePath = ToFString(Link.routePath);
 	Result.PayloadJson = ToFString(Link.payloadJson);
+	Result.Campaign.Source = ToFString(Link.campaign.source);
+	Result.Campaign.Medium = ToFString(Link.campaign.medium);
+	Result.Campaign.Campaign = ToFString(Link.campaign.campaign);
+	Result.Campaign.Term = ToFString(Link.campaign.term);
+	Result.Campaign.Content = ToFString(Link.campaign.content);
+	Result.bIsDeferred = Link.isDeferred;
+	Result.bIsProbabilisticMatch = Link.isProbabilisticMatch;
 	return Result;
+}
+
+EStrybokDeferredLinkStatus StrybokConvert::ToStatus(strybok::DeferredLinkStatus Status)
+{
+	switch (Status)
+	{
+	case strybok::DeferredLinkStatus::Checking:
+		return EStrybokDeferredLinkStatus::Checking;
+	case strybok::DeferredLinkStatus::Pending:
+		return EStrybokDeferredLinkStatus::Pending;
+	case strybok::DeferredLinkStatus::NotFirstLaunch:
+		return EStrybokDeferredLinkStatus::NotFirstLaunch;
+	case strybok::DeferredLinkStatus::Unavailable:
+		return EStrybokDeferredLinkStatus::Unavailable;
+	case strybok::DeferredLinkStatus::NoReferrer:
+		return EStrybokDeferredLinkStatus::NoReferrer;
+	case strybok::DeferredLinkStatus::NotFound:
+		return EStrybokDeferredLinkStatus::NotFound;
+	case strybok::DeferredLinkStatus::Superseded:
+		return EStrybokDeferredLinkStatus::Superseded;
+	case strybok::DeferredLinkStatus::Delivered:
+		return EStrybokDeferredLinkStatus::Delivered;
+	case strybok::DeferredLinkStatus::Failed:
+		return EStrybokDeferredLinkStatus::Failed;
+	case strybok::DeferredLinkStatus::AwaitingPaste:
+		return EStrybokDeferredLinkStatus::AwaitingPaste;
+	case strybok::DeferredLinkStatus::Disabled:
+	default:
+		return EStrybokDeferredLinkStatus::Disabled;
+	}
+}
+
+EStrybokPastedLinkResult StrybokConvert::ToPastedResult(strybok::PastedLinkResult Result)
+{
+	switch (Result)
+	{
+	case strybok::PastedLinkResult::Delivered:
+		return EStrybokPastedLinkResult::Delivered;
+	case strybok::PastedLinkResult::NotOurs:
+		return EStrybokPastedLinkResult::NotOurs;
+	case strybok::PastedLinkResult::NotFound:
+		return EStrybokPastedLinkResult::NotFound;
+	case strybok::PastedLinkResult::AlreadyHandled:
+		return EStrybokPastedLinkResult::AlreadyHandled;
+	case strybok::PastedLinkResult::Disabled:
+		return EStrybokPastedLinkResult::Disabled;
+	case strybok::PastedLinkResult::Failed:
+	default:
+		return EStrybokPastedLinkResult::Failed;
+	}
+}
+
+strybok::InstallReferrerSource StrybokConvert::ToCoreSource(const FStrybokInstallReferrerSource& Source)
+{
+	// std::function may hold a TFunction; the other way round the std::function is boxed, because
+	// engine closures are relocated with memcpy.
+	return [Source](std::function<void(const strybok::InstallReferrerAnswer&)> Answer)
+	{
+		if (!Source)
+		{
+			Answer(strybok::InstallReferrerAnswer()); // "unavailable"
+			return;
+		}
+		const TSharedRef<std::function<void(const strybok::InstallReferrerAnswer&)>, ESPMode::ThreadSafe> BoxedAnswer =
+			MakeShared<std::function<void(const strybok::InstallReferrerAnswer&)>, ESPMode::ThreadSafe>(std::move(Answer));
+		Source([BoxedAnswer](const FStrybokInstallReferrerAnswer& Result)
+		{
+			const TSharedRef<strybok::InstallReferrerAnswer, ESPMode::ThreadSafe> Converted =
+				MakeShared<strybok::InstallReferrerAnswer, ESPMode::ThreadSafe>();
+			switch (Result.Kind)
+			{
+			case EStrybokInstallReferrerAnswer::Referrer:
+				Converted->kind = strybok::InstallReferrerAnswer::Kind::Referrer;
+				// Handed to the core only; never logged or stored.
+				Converted->referrer = ToStd(Result.Referrer);
+				break;
+			case EStrybokInstallReferrerAnswer::UnavailableForNow:
+				Converted->kind = strybok::InstallReferrerAnswer::Kind::UnavailableForNow;
+				break;
+			case EStrybokInstallReferrerAnswer::Unavailable:
+			default:
+				Converted->kind = strybok::InstallReferrerAnswer::Kind::Unavailable;
+				break;
+			}
+			if (IsInGameThread())
+			{
+				(*BoxedAnswer)(*Converted);
+			}
+			else
+			{
+				// Store callbacks arrive on other threads; the core is game thread only. If the
+				// engine is gone by then, the core's callback finds nothing to do.
+				AsyncTask(ENamedThreads::GameThread, [BoxedAnswer, Converted]()
+				{
+					(*BoxedAnswer)(*Converted);
+				});
+			}
+		});
+	};
 }
 
 FStrybokError StrybokConvert::ToError(const strybok::LinkError& Error)
@@ -123,7 +232,81 @@ strybok::Config StrybokConvert::ToCoreConfig(const FStrybokConfig& Config)
 #endif
 	Result.sdkVersion = strybok::kSdkVersion;
 	Result.clientKey = ToStd(Config.ClientKey.TrimStartAndEnd());
+	Result.deferredLinks = Config.bDeferredLinks;
+	Result.allowProbabilisticMatching = Config.bAllowProbabilisticMatching;
+	Result.androidPackageName = ToStd(Config.AndroidPackageName.TrimStartAndEnd());
+	Result.iosBundleId = ToStd(Config.IosBundleId.TrimStartAndEnd());
 	return Result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deferred links: the two stored values
+// ---------------------------------------------------------------------------------------------
+
+FStrybokDeferredFileStore::FStrybokDeferredFileStore()
+	: FilePath(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Strybok"), TEXT("DeferredLinks.txt")))
+{
+}
+
+bool FStrybokDeferredFileStore::Load(TMap<FString, FString>& OutValues) const
+{
+	OutValues.Reset();
+	if (!FPaths::FileExists(FilePath))
+	{
+		return true; // nothing stored yet
+	}
+	FString Content;
+	if (!FFileHelper::LoadFileToString(Content, *FilePath))
+	{
+		return false;
+	}
+	// One "key=value" per line.
+	TArray<FString> Lines;
+	Content.ParseIntoArrayLines(Lines);
+	for (const FString& Line : Lines)
+	{
+		FString Key;
+		FString Value;
+		if (Line.Split(TEXT("="), &Key, &Value))
+		{
+			OutValues.Add(Key.TrimStartAndEnd(), Value.TrimStartAndEnd());
+		}
+	}
+	return true;
+}
+
+bool FStrybokDeferredFileStore::Read(const std::string& Key, std::string& OutValue, bool& bOutFound)
+{
+	TMap<FString, FString> Values;
+	if (!Load(Values))
+	{
+		return false;
+	}
+	const FString* Found = Values.Find(StrybokConvert::ToFString(Key));
+	bOutFound = Found != nullptr;
+	OutValue = Found != nullptr ? StrybokConvert::ToStd(*Found) : std::string();
+	return true;
+}
+
+bool FStrybokDeferredFileStore::Write(const std::string& Key, const std::string& Value)
+{
+	TMap<FString, FString> Values;
+	if (!Load(Values))
+	{
+		return false; // never overwrite what could not be read
+	}
+	Values.Add(StrybokConvert::ToFString(Key), StrybokConvert::ToFString(Value));
+
+	FString Content;
+	for (const TPair<FString, FString>& Entry : Values)
+	{
+		Content += Entry.Key;
+		Content += TEXT("=");
+		Content += Entry.Value;
+		Content += TEXT("\n");
+	}
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(FilePath), true);
+	return FFileHelper::SaveStringToFile(Content, *FilePath);
 }
 
 // ---------------------------------------------------------------------------------------------

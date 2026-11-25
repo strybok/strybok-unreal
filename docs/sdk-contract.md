@@ -5,22 +5,31 @@ Every Strybok SDK behaves the same way. The Flutter SDK
 reference implementation; its test suite is the reference test list. This page is the
 language-neutral version of it.
 
-Deferred deep linking (restoring a link after a store install) is **not** supported by any SDK.
+Deferred links (restoring a link after a store install) are specified in
+[Deferred links (Android)](#deferred-links-optional-android) and
+[Deferred links on iOS](#deferred-links-on-ios-optional): optional, off by default, and very
+different on the two platforms. Which SDK versions implement them is listed in
+[Which SDKs implement deferred links](#which-sdks-implement-deferred-links). All of them are
+unreleased at the time of writing and **none has run on a device, against a real store, with a
+real pasteboard or against the production API**. There is no automatic deferred deep linking on
+iOS. An SDK version without the `deferredLinks` option restores nothing after installation.
 
 ## Configuration
 
-| Option           | Default  | Meaning                                                                                                                                                                                                 |
-| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiBaseUrl`     | required | Base URL of the API, e.g. `https://api.strybok.com`. A path prefix is preserved.                                                                                                                        |
-| `allowedHosts`   | required | Link hostnames of this app, compared lower-case. Other hosts are ignored.                                                                                                                               |
-| `timeout`        | 5 s      | Time allowed for one resolve attempt.                                                                                                                                                                   |
-| `maxRetries`     | 2        | Extra attempts after a timeout, network error or 5xx.                                                                                                                                                   |
-| `retryDelay`     | 400 ms   | Pause before the first retry; doubles for each further retry.                                                                                                                                           |
-| `dedupeWindow`   | 2 s      | The identical URL received again within this window is dropped.                                                                                                                                         |
-| `reportAppOpens` | `true`   | Send a best-effort `app_open` event after a link was resolved.                                                                                                                                          |
-| `onError`        | none     | Receives errors for our links that could not be resolved.                                                                                                                                               |
-| `clientKey`      | none     | Publishable key `pk_…` of the application. Only needed for `createLink`.                                                                                                                                |
-| `attestation`    | `false`  | Prove to the server that this is the genuine app before creating links. Only SDKs that support it have this option (Android also needs `cloudProjectNumber`), see [Attestation](#attestation-optional). |
+| Option                       | Default  | Meaning                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apiBaseUrl`                 | required | Base URL of the API, e.g. `https://api.strybok.com`. A path prefix is preserved.                                                                                                                                                                                                                                           |
+| `allowedHosts`               | required | Link hostnames of this app, compared lower-case. Other hosts are ignored.                                                                                                                                                                                                                                                  |
+| `timeout`                    | 5 s      | Time allowed for one resolve attempt.                                                                                                                                                                                                                                                                                      |
+| `maxRetries`                 | 2        | Extra attempts after a timeout, network error or 5xx.                                                                                                                                                                                                                                                                      |
+| `retryDelay`                 | 400 ms   | Pause before the first retry; doubles for each further retry.                                                                                                                                                                                                                                                              |
+| `dedupeWindow`               | 2 s      | The identical URL received again within this window is dropped.                                                                                                                                                                                                                                                            |
+| `reportAppOpens`             | `true`   | Send a best-effort `app_open` event after a link was resolved.                                                                                                                                                                                                                                                             |
+| `onError`                    | none     | Receives errors for our links that could not be resolved.                                                                                                                                                                                                                                                                  |
+| `clientKey`                  | none     | Publishable key `pk_…` of the application. Only needed for `createLink`.                                                                                                                                                                                                                                                   |
+| `attestation`                | `false`  | Prove to the server that this is the genuine app before creating links. Only SDKs that support it have this option (Android also needs `cloudProjectNumber`), see [Attestation](#attestation-optional).                                                                                                                    |
+| `deferredLinks`              | `false`  | Restore a link that was tapped before the app was installed. Android: ask the store for its install referrer on the first launch, see [Deferred links](#deferred-links-optional-android). iOS: only the two flows of [Deferred links on iOS](#deferred-links-on-ios-optional). Only SDKs that support it have this option. |
+| `allowProbabilisticMatching` | `false`  | iOS only, and only together with `deferredLinks`: let the server guess the link from the network address, see [Probabilistic matching](#flow-b-probabilistic-matching). Forbidden by Apple's rules; the app developer opts in here in code, separately from the owner's setting.                                           |
 
 The source of incoming URLs (`LinkSource`: a launch URL plus a stream of later URLs) and the HTTP
 transport are replaceable, so the SDK can be tested without a device or a network.
@@ -35,14 +44,40 @@ A URL is a Strybok link of this app only when **all** of these hold:
 - no port, or port 443;
 - path matches `^/[A-Za-z0-9_-]{1,64}$` (exactly one slug segment, no trailing slash).
 
-Query and fragment are allowed and ignored. Anything else is dropped silently by the automatic
-flow (no error, no network call) and rejected with `UnsupportedLink` by `resolve`.
+Query and fragment are allowed and do not decide whether a URL is ours. Anything else is dropped
+silently by the automatic flow (no error, no network call) and rejected with `UnsupportedLink` by
+`resolve`.
 
 ## Resolving
 
 `GET {apiBaseUrl}/v1/public/resolve?url={lookup}` with `Accept: application/json`, where `lookup`
-is `https://{lower-cased host}{path}` — query and fragment are **never** sent, they may hold
-private data.
+is `https://{lower-cased host}{path}` followed by the **campaign query** described below. The rest
+of the query and the fragment are **never** sent, they may hold private data.
+
+### Campaign query
+
+_Added on 2026-11-24 (decision 0018). SDK versions
+released before that send no query at all; see "Older SDK versions" below._
+
+From the query string of the tapped URL the SDK keeps **only** these keys, compared exactly
+(lower case): `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`.
+
+1. Split the raw query on `&`, each part on its first `=`; percent-decode key and value as UTF-8,
+   treating `+` as a space (a standard query parser such as `URLSearchParams`, `URLComponents`
+   or `Uri.getQueryParameter` does this).
+2. For each of the five keys take its **first** occurrence. Drop it unless the decoded value is
+   1–64 characters long and consists only of `A–Z a–z 0–9 . _ ~ -`.
+3. If nothing is left, `lookup` has no `?` at all — exactly what earlier versions sent.
+4. Otherwise append `?` and the kept pairs as `key=value` joined with `&`, in the fixed order
+   `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`. The allowed characters
+   never need encoding inside `lookup`. (`lookup` as a whole is then percent-encoded as the value
+   of `url`, as before.)
+
+Example: tapped `https://MyApp.strybok.link/invite777?utm_source=instagram&fbclid=abc&utm_medium=two%20words&utm_source=x#top`
+→ `lookup` = `https://myapp.strybok.link/invite777?utm_source=instagram`.
+
+The server applies the same rule again and ignores everything else, so an SDK that passed more
+would not change the answer — but it must not, for privacy. Dropping a value is never an error.
 
 | Outcome                                                                                   | Result            | Retried |
 | ----------------------------------------------------------------------------------------- | ----------------- | ------- |
@@ -57,9 +92,25 @@ private data.
 After `maxRetries` extra attempts the last error is reported. `payload` is the JSON object from the
 response, or an empty object when it is missing or not an object.
 
+The response may carry `campaign`: an object with any of the string fields `source`, `medium`,
+`campaign`, `term`, `content`. It holds the link's default campaign values, overridden per key by
+the campaign query that was sent. The field is **absent** when there is no value at all. The SDK
+keeps the string fields with those five names and ignores everything else; a missing `campaign`,
+one that is not an object, or a field that is not a string, is never an error.
+
 A resolved link has: the original `uri` (as received, with query), `linkId`, `appId`, `routePath`,
-`payload`. `routePath` and `payload` are untrusted data chosen by whoever created the link: apps
-map them onto routes they already know.
+`payload`, and `campaign` — an object or record with the optional string properties `source`,
+`medium`, `campaign`, `term`, `content`, **never null**: it is empty when the server sent none.
+`routePath`, `payload` and `campaign` are untrusted data chosen by whoever created or shared the
+link: apps map them onto routes they already know, and treat campaign values as labels only.
+
+`dedupeWindow` keeps comparing the full URL string as received, so the same slug tapped with
+different campaign parameters is two links.
+
+**Older SDK versions.** A version that sends no campaign query keeps working unchanged: the
+server answers with the link's default values in `campaign` (or without the field), which such a
+version ignores. Its users are simply not attributed to the campaign of the URL they tapped, and
+its `app_open` events are counted under the link's defaults (below).
 
 ## Delivery
 
@@ -87,9 +138,17 @@ After a link is delivered (or queued), when `reportAppOpens` is on:
   "linkId": "<linkId>",
   "type": "app_open",
   "platform": "ios | android | unknown",
-  "sdkVersion": "<SDK version, at most 32 characters>"
+  "sdkVersion": "<SDK version, at most 32 characters>",
+  "campaign": { "source": "instagram", "medium": "social" }
 }
 ```
+
+`campaign` is the resolved link's `campaign`, **exactly as the server returned it** (only the five
+string fields). It is **omitted** when it is empty. The SDK does not build it from the URL itself:
+what resolve returned is what is reported. The server validates it like every other input (422
+for an unknown field or a value outside the allowed characters, which cannot happen with values
+that came from resolve), applies it on top of the link's defaults, and counts the open per
+source, medium and campaign. An event without `campaign` is counted under the link's defaults.
 
 No other fields are allowed. The call is never awaited by delivery, and any failure is swallowed:
 analytics must never delay or break navigation.
@@ -360,6 +419,473 @@ In addition to what `createLink` sends: the App Attest key id, attestation and a
 read or sent by the SDK; the App Attest key id is random per installation and the Play Integrity
 token is readable only by Google.
 
+## Deferred links (optional, Android)
+
+_Added on 2026-11-24 (decision 0019). Implemented,
+covered by unit tests only, by Android (Kotlin) and Kotlin Multiplatform 0.4.0 with the shipped
+store sources, and by Flutter, JavaScript, React Native, Capacitor, Unity, .NET and Unreal 0.3.0
+with sources the app supplies — see
+[Which SDKs implement deferred links](#which-sdks-implement-deferred-links). SDK versions
+without the `deferredLinks` option are described under "Older SDK versions" at the end of this
+section._
+
+A person taps a link, does not have the app, installs it from the store page the link sent them
+to, and opens it: the SDK delivers that link on the first launch. This works only
+
+- on **Android**;
+- when the owner switched "restore the link after install" on for the application;
+- when the installation went through the **store app** of Google Play, Huawei AppGallery or
+  Samsung Galaxy Store, from the page the link opened (not after a search, not from the store's
+  website, not from an APK file);
+- within **24 hours** of the tap;
+- once.
+
+Google Play is specified from Google's documentation. **AppGallery and Galaxy Store are
+unverified**: their parts below come from Huawei's published pages and from Samsung's published
+library, but how those stores treat our value was never tried, and nothing in this section has
+run on a device. iOS has no install referrer; what exists there instead is in
+[Deferred links on iOS](#deferred-links-on-ios-optional).
+
+### Configuration
+
+| Option                   | Default  | Meaning                                                                                                                                                                          |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deferredLinks`          | `false`  | Run the check below. With `false` the SDK does nothing described in this section: no source is asked, no request is made, nothing is stored.                                     |
+| `installReferrerSources` | empty    | Ordered list of referrer sources (below). Empty means the check ends at once with status `unavailable`.                                                                          |
+| `androidPackageName`     | platform | The app's own application ID. SDKs with native Android code read it from the platform and have no such option; SDKs without native code (pure Dart, pure JavaScript) require it. |
+
+**Referrer source** (`InstallReferrerSource`): one operation, called off the main thread, that
+answers with exactly one of
+
+- **referrer** — the raw install referrer string of the store the app was installed from,
+  exactly as the store returned it (it may be empty);
+- **unavailable for now** — the store could not be asked; a later launch may succeed;
+- **unavailable** — this store is not on the device, is too old, or its library is not in the
+  app. Asking again is pointless.
+
+A source must not throw, must give its answer within 10 seconds (the SDK treats a longer wait
+as "unavailable for now" and abandons the call), and must release whatever connection it
+opened. The source is replaceable, like `LinkSource` and the transport, so everything here is
+testable without a device.
+
+### State
+
+The SDK keeps two values in its own private storage, per installation: `attempts` (integer,
+starts at 0) and `done` (boolean). They are removed with the app's data. Nothing else about the
+check is stored — not the referrer, not the click id.
+
+### When it runs
+
+At most once per process, **after** `initialize`/`start` has completed everything it does
+today. `initialize`/`start`, the launch link, `getInitialLink` and `createLink` never wait for
+the check and never depend on its result. A slow or hanging source delays nothing but the
+deferred link.
+
+SDKs with native Android access also skip the check — status `notFirstLaunch`, `done` stored —
+when the platform reports that the app was updated since it was installed
+(`PackageInfo.firstInstallTime != lastUpdateTime`), so a person who merely updates to an app
+version with this feature is not asked about an old referrer. SDKs without that access rely on
+the server: an id older than 24 hours is refused.
+
+### Flow
+
+1. `deferredLinks` is off → status `disabled`. Stop.
+2. `done` is stored → status `notFirstLaunch`. Stop.
+3. `attempts` is 3 or more → store `done`; status `failed`. Stop.
+4. **Store `attempts + 1` now**, before anything else happens. (Why: see
+   [Crashes](#crashes-and-the-once-only-guarantee).)
+5. Ask the sources in order, one after another. For each answer:
+   - a referrer in which a click id is found (next paragraph) → use that id; ask no further
+     source;
+   - anything else → remember the kind of answer and ask the next source.
+
+   If no source produced an id:
+   - at least one said "unavailable for now" → status `pending`; stop **without** storing
+     `done`. The next launch runs the flow again, until step 3 ends it;
+   - otherwise store `done`; status `noReferrer` if any source returned a string, else
+     `unavailable`. Stop.
+
+6. If a link of this app has been accepted (it passed ["Which URLs are ours"](#which-urls-are-ours))
+   since the process started → store `done`; status `superseded`. **No request is made.**
+7. `POST {apiBaseUrl}/v1/public/deferred-links/redeem` with `Content-Type: application/json`,
+   `Accept: application/json` and
+
+   ```json
+   {
+     "platform": "android",
+     "clickId": "dc_…",
+     "packageName": "<application ID>",
+     "sdkVersion": "<SDK version>"
+   }
+   ```
+
+   (`platform` may be left out by an Android SDK; the server then assumes `android`.)
+
+   No other fields: the request carries nothing about the device, and none of the rest of the
+   referrer. `timeout`, `maxRetries` and `retryDelay` apply as for resolving; a retry sends the
+   identical body (the server answers a repeat within two minutes with the same link).
+
+**Finding the click id in a referrer.** Split the string on `&`, each part on its first `=`.
+Take the **first** part whose key is exactly `strybok_click`; its value must match
+`^dc_[0-9A-Za-z]{32}$` as it stands (those characters are never encoded). If no part has that
+key and the string contains `strybok_click%3D` (in any letter case), percent-decode the whole
+string once and try again — a store may return the value still encoded. Everything else in the
+referrer — campaign keys, other vendors' keys, timestamps a library offers — is **ignored**: not
+parsed further, not stored, not sent, not logged. A missing key or a value that does not match
+is "no id", never an error.
+
+| Outcome of the request                                                                                                                                                      | Result                                                                                       |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 200 with `linkId`, `appId`, `routePath` valid as for resolving, `deferred` = `true`, and `url` a link of this app (it passes ["Which URLs are ours"](#which-urls-are-ours)) | Store `done`, then deliver — unless a link of this app was accepted meanwhile (`superseded`) |
+| 200 with anything else (not JSON, missing fields, `url` on a host outside `allowedHosts`)                                                                                   | Store `done`; status `failed`. Nothing is delivered                                          |
+| 404, any other 4xx except 429                                                                                                                                               | Store `done`; status `notFound`                                                              |
+| 429 (not retried in this launch), or 5xx / transport failure / timeout after the retries                                                                                    | Status `pending`, `done` not stored: a later launch tries again, until step 3 ends it        |
+
+### Delivery
+
+The deferred link is a resolved link like any other, with `uri` = the answer's `url`, `payload`
+and `campaign` read exactly as for [resolving](#resolving), and one new property on **every**
+resolved link: `isDeferred` (boolean; `true` here, `false` for links that arrived the normal
+way).
+
+- It goes through the same exactly-once pipeline: the normal stream or listener, queued until a
+  listener attaches.
+- `getInitialLink` **never** returns it: it is not the launch link, and it can arrive seconds
+  after the app showed its first screen.
+- `done` is stored **before** the link is handed to the pipeline; status `delivered`.
+- **A normal link wins.** If a link of this app is accepted at any moment before the deferred
+  link has been handed to the pipeline — the launch URL, or one that arrives while the request
+  is in flight — the deferred link is dropped (`superseded`): one launch, one navigation. It is
+  not queued behind the other link and it is never delivered later.
+- No `app_open` event is sent for a deferred link, whatever `reportAppOpens` says. The server
+  counted the redemption itself.
+- After `dispose`/`stop` nothing is delivered; `done` is stored if the answer had arrived.
+
+### Crashes and the once-only guarantee
+
+The rule is **at most once**: a deferred link may be lost, it is never delivered twice and the
+check never repeats without end.
+
+- `attempts` is written before the sources are asked, so a launch that crashes or is killed at
+  any point of the check has used up one of three attempts. An app that crashes on every start
+  stops asking after the third.
+- `done` is not written before the request, because the first launch after an install is
+  exactly when a network call fails for ordinary reasons (captive portal, the person is in a
+  lift). Writing it first would turn every such launch into a lost link.
+- `done` is written before delivery, so a crash after the app received the link cannot deliver
+  it again. A crash between the answer and that write costs an attempt; the next launch sends
+  the same id again and the server either repeats its answer (within two minutes) or refuses it
+  (after) — one delivery or none.
+- The server is the second lock: an id is redeemable once, so even an SDK that lost its state
+  (cleared app data) gets `notFound`.
+
+### Status and errors
+
+Most people who install an app never tapped a link. A check that finds nothing is the normal
+case, and a check that fails is not a failed link. So **nothing in this section is reported to
+`onError`, nothing throws, and nothing is shown**. For developers and QA the SDK exposes
+`deferredLinkStatus`, readable at any time and observable where the platform has a natural way:
+
+| Status           | Meaning                                                                                            | Final |
+| ---------------- | -------------------------------------------------------------------------------------------------- | ----- |
+| `disabled`       | `deferredLinks` is off                                                                             | —     |
+| `checking`       | The check is running in this launch                                                                | no    |
+| `pending`        | This launch could not finish the check (store or network not reachable); a later launch tries      | no    |
+| `notFirstLaunch` | The check was finished in an earlier launch, or the app was updated since it was installed         | yes   |
+| `unavailable`    | No source is configured, or none can ever answer on this device                                    | yes   |
+| `noReferrer`     | The store returned a referrer without a click id of ours (the usual result of an ordinary install) | yes   |
+| `notFound`       | The server refused the id: unknown, older than 24 hours, already used, or not this application's   | yes   |
+| `superseded`     | A normal link of this app arrived first                                                            | yes   |
+| `delivered`      | The link was handed to the delivery pipeline                                                       | yes   |
+| `failed`         | Three launches could not finish the check, or the server's answer was unusable                     | yes   |
+
+SDKs may log the status in debug builds. They must never log the referrer or the click id.
+
+### Sources shipped with the Android SDK
+
+All three are shipped **as code** in the Android SDK (and in `androidMain` of the Kotlin
+Multiplatform SDK). None adds a dependency to the published artifact: the two that need a
+vendor library are compiled against it as `compileOnly`, exactly like Play Integrity, and answer
+"unavailable" when the app did not add it. Reasons for shipping code instead of documented
+snippets: Samsung's library is on Maven Central and Huawei's mechanism needs no library, so
+there is nothing an app could add that we cannot compile against; and three copies of the
+response-code mapping in app code would be three places to get it wrong.
+
+| Source                             | Store                | The app adds                                                                                                                                                                                                                                 | Standing                                                                                                                                                                                                                                                       |
+| ---------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PlayInstallReferrerSource`        | Google Play          | `com.android.installreferrer:installreferrer:2.2` (Google's Maven repository)                                                                                                                                                                | From Google's documentation. Not device-tested                                                                                                                                                                                                                 |
+| `GalaxyStoreInstallReferrerSource` | Samsung Galaxy Store | `store.galaxy.samsung.installreferrer:samsung_galaxystore_install_referrer:4.0.0` (Maven Central)                                                                                                                                            | **Unverified.** API read from the library's published sources; Galaxy Store 4.5.20.1 or later. Whether a referrer put on an `https` store link reaches the app is known from third parties only                                                                |
+| `AppGalleryInstallReferrerSource`  | Huawei AppGallery    | Nothing to compile. Possibly a `<queries>` entry for the provider authority `com.huawei.appmarket.commondata` and the permission `com.huawei.appmarket.service.commondata.permission.GET_COMMON_DATA` — **unverified**, not in Huawei's page | **Unverified.** From Huawei's AppGallery Connect pages; AppGallery 10.5.0.300 or later. Huawei states the provider "may be called only after user consent"; the app is responsible for that, and enables `deferredLinks` (or adds this source) only afterwards |
+
+`PlayInstallReferrerSource` and `GalaxyStoreInstallReferrerSource` use the vendor's
+`InstallReferrerClient` (`com.android.installreferrer.api` and
+`com.samsung.android.sdk.sinstallreferrer.api`; same shape, same response codes):
+
+| Result of `startConnection`                                                | Answer of the source                                   |
+| -------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `OK` (0)                                                                   | The string from `ReferrerDetails.getInstallReferrer()` |
+| `SERVICE_UNAVAILABLE` (1), `SERVICE_DISCONNECTED` (-1), a remote exception | Unavailable for now                                    |
+| `FEATURE_NOT_SUPPORTED` (2), `DEVELOPER_ERROR` (3)                         | Unavailable                                            |
+| The vendor library is not in the app (class not found)                     | Unavailable                                            |
+
+The connection is always closed with `endConnection()`. Of `ReferrerDetails` only the referrer
+string is read; the click and install timestamps are not.
+
+`AppGalleryInstallReferrerSource` queries the content provider
+`content://com.huawei.appmarket.commondata/item/5` with the app's own package name as the single
+selection argument (`query(uri, null, null, arrayOf(packageName), null)`) and returns column
+**5** of the first row as the referrer (Huawei: "Referrer parameter set in the download link").
+No provider, a null cursor, no row or fewer than six columns → unavailable; a
+`SecurityException` → unavailable; any other failure → unavailable for now. No other column is
+read.
+
+A recommended default for apps distributed in all three stores is the list
+`[Play, GalaxyStore, AppGallery]`: a source whose store did not install the app returns no id
+and the next one is asked.
+
+### Cross-platform SDKs
+
+| SDK                              | How it gets the referrer                                                                                                                                                                                 |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Android (Kotlin)                 | The shipped sources                                                                                                                                                                                      |
+| Kotlin Multiplatform             | The same sources in `androidMain`; the flow in common code. On other targets the option is ignored (status `disabled`)                                                                                   |
+| Flutter, React Native, Capacitor | No native code of ours: `installReferrerSources` takes functions the app fills from a plugin of its choice, returning the three answers above. `androidPackageName` is required. Off Android: `disabled` |
+| Unity, .NET MAUI, Unreal         | The same source interface as a delegate the app fills (0.3.0 ships no store source of its own)                                                                                                           |
+| iOS (Swift)                      | No install referrer. `deferredLinks` enables only the flows of [Deferred links on iOS](#deferred-links-on-ios-optional)                                                                                  |
+| JavaScript (`@strybok/js`)       | The same functions as React Native and Capacitor, which wrap it. On a platform that is neither Android nor iOS (a web page): `disabled`                                                                  |
+
+Every SDK that implements the option implements the whole flow, state and status of this
+section, with tests against a fake source and the stub transport: disabled by default; start
+completes while a source blocks; attempts counted before the source is asked; three attempts,
+then `failed`; every status; a normal link wins before and during the request; `done` before
+delivery; restart after each step; a `url` outside `allowedHosts` is dropped; malformed and
+still-encoded referrers; several sources in order; no `app_open`.
+
+### What deferred links send and read
+
+With `deferredLinks` on, the SDK reads the store's install referrer at most three times in the
+life of an installation and sends **only** the click id found in it, the app's package name and
+the SDK version. The id is random, made by the service when the link was tapped, usable once
+and for 24 hours, and says nothing about the device or the person. Reading the referrer is
+access to information stored on the device; whether the app needs the person's consent first is
+for the app developer to decide, and the SDK supports that by doing nothing until the app
+switches `deferredLinks` on — which SDKs must allow after start, for example after a consent
+screen (`enableDeferredLinks()` or an equivalent setter; calling it runs the flow once).
+
+**Older SDK versions.** A version without the `deferredLinks` option never asks a store and
+never calls the redeem endpoint; it keeps working unchanged whether or not the owner switched
+the feature on. For its users the click ids in store URLs are simply never used and expire. A
+version that does not know `isDeferred` cannot receive a deferred link, so the property needs no
+default on old link objects. The redeem answer may gain fields; SDKs ignore fields they do not
+know, as for resolving.
+
+## Deferred links on iOS (optional)
+
+_Added on 2026-11-24 (decision 0019). Implemented,
+covered by unit tests only, by iOS (Swift) 0.4.0 and Kotlin Multiplatform 0.4.0 (`iosMain`), and
+by Flutter, JavaScript, React Native, Capacitor, Unity, .NET and Unreal 0.3.0, where the app
+supplies the pasted text and, for flow B, the device family and language — see
+[Which SDKs implement deferred links](#which-sdks-implement-deferred-links)._
+
+The App Store passes nothing from a link to a newly installed app. There are two flows, each
+switched on per application by the owner **and** in the app by the developer, both off by
+default, and neither comparable to Android's:
+
+- **A. Pasted link** — the person copies the link on a page before the App Store and pastes it
+  in the app. Honest and exact, but it needs two deliberate actions by the person.
+- **B. Probabilistic matching** — the server guesses from the network address. Invisible, often
+  wrong or impossible, and **forbidden by Apple's rules**. Specified because owners may choose
+  it; not recommended.
+
+Nothing here has run on a device. `deferredLinks` on an iOS SDK enables flow A; flow B also
+needs `allowProbabilisticMatching`. With `deferredLinks` off, an iOS SDK does nothing of this
+section.
+
+State is the same pair as on Android, per installation: `attempts` (used by flow B only) and
+`done`. **Once either flow delivered a link, or flow A got a definite answer from the server,
+`done` is stored and neither flow does anything again.**
+
+### Flow A: pasted link
+
+On the server (owner setting `iosDeferredClipboard`): an iOS visitor who would be sent to the
+App Store sees a page with a "Copy link and get the app" button. It copies
+`https://<link host>/<slug>?strybok_click=dc_<32 characters>` — the link itself plus a
+single-use click id of the same kind as Android's — and opens the App Store.
+
+**The SDK never reads the pasteboard.** No SDK code may call `UIPasteboard`'s `string`, `url`,
+`strings`, `urls`, `items`, `detectValues(for:…)` / `detectedValues(for:)` or anything else that
+returns pasteboard content. The app obtains the string — from Apple's `UIPasteControl` (the
+system paste button, iOS 16 or later: tapping it is the person's consent, and no "Allow Paste"
+alert appears) or from a paste action of its own — and hands it to the SDK:
+
+`redeemPastedLink(string)` → one of `delivered`, `notOurs`, `notFound`, `alreadyHandled`,
+`disabled`, `failed`.
+
+1. `deferredLinks` is off → `disabled`. `done` is stored → `alreadyHandled`. No request.
+2. Trim the string. It must parse as a URL that passes
+   ["Which URLs are ours"](#which-urls-are-ours), and the **first** `strybok_click` parameter of
+   its query must match `^dc_[0-9A-Za-z]{32}$`. Anything else → `notOurs`: **no request is
+   made** and the string is dropped — not stored, not logged, not sent anywhere. (The person
+   may have had anything on their clipboard.)
+3. `POST {apiBaseUrl}/v1/public/deferred-links/redeem` with
+
+   ```json
+   {
+     "platform": "ios",
+     "clickId": "dc_…",
+     "bundleId": "<Bundle.main.bundleIdentifier>",
+     "sdkVersion": "<SDK version>"
+   }
+   ```
+
+   `timeout`, `maxRetries` and `retryDelay` as for resolving; a retry sends the identical body.
+   Only the click id is sent, never the pasted URL.
+
+| Outcome                                                                                                           | Result                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| 200 with `linkId`, `appId`, `routePath` valid as for resolving, `deferred` = `true`, and `url` a link of this app | Store `done`, then deliver; `delivered`                                                 |
+| 200 with anything else                                                                                            | Store `done`; `failed`                                                                  |
+| 404, any other 4xx except 429                                                                                     | Store `done`; `notFound` (unknown, older than 24 hours, already used, another app's id) |
+| 429, 5xx, transport failure, timeout — after the retries                                                          | `failed`; `done` is **not** stored, so the person can tap Paste again                   |
+
+Delivery is as on Android: a resolved link with `uri` = the answer's `url` (without the click
+id), `isDeferred` = `true`, through the normal exactly-once pipeline; `getInitialLink` never
+returns it; no `app_open` is sent. One difference: **a pasted link is delivered even if a normal
+link was delivered earlier in this launch** — pasting was the person's own, explicit action.
+
+**Optional: is there anything to paste?** An SDK may offer `pasteboardMayContainLink()` so the
+app can decide whether to show its paste button. It must be implemented with
+`UIPasteboard.general.detectPatterns(for: [.probableWebURL], completionHandler:)` (iOS 14 or
+later; the `async` form is `detectedPatterns(for:)`, iOS 15 or later), which Apple documents as
+determining whether the pasteboard matches the patterns "without notifying the user": it reads
+no content and shows no banner or alert. It answers only "probably a web URL" — it cannot know
+whether the URL is ours — and returns `false` when `done` is stored or `deferredLinks` is off.
+SDKs may leave this method out.
+
+What the app developer is told: place the paste control on the first screen or in onboarding,
+with a sentence that says what it does; describe it in the App Review notes; do not paste
+automatically.
+
+Hybrid SDKs (Flutter, React Native, Capacitor, .NET MAUI, Unity) expose `redeemPastedLink` with
+a plain string argument; the paste button is the app's, from whatever plugin it uses. They never
+read the clipboard either.
+
+### Flow B: probabilistic matching
+
+On the server (owner setting `iosDeferredMatching`, plus `allowProbabilisticMatch` on each
+link): when an iOS visitor is sent to the App Store, a keyed hash of their network address,
+device family and primary language is kept for 15 minutes to 6 hours. The first launch is
+matched against it.
+
+**This is fingerprinting in Apple's terms.** The App Store Review Guidelines and the Apple
+Developer Program License Agreement forbid deriving data from a device to identify it, with or
+without the user's consent. An SDK that implements this flow must say so in its documentation
+next to the option, and must keep it off unless the developer sets
+`allowProbabilisticMatching` explicitly. A match is a guess: on a shared network it can be
+**another person's link**.
+
+Runs only when `deferredLinks` **and** `allowProbabilisticMatching` are on, at most once per
+process, after `initialize`/`start` has completed everything it does today; nothing waits for
+it.
+
+1. `done` is stored → status `notFirstLaunch`. Stop.
+2. **Clipboard first.** If the SDK implements `pasteboardMayContainLink()` and it answers
+   `true`, the SDK does not match yet: status `awaitingPaste`. Matching then starts only when
+   the app calls `redeemPastedLink` and gets `notOurs`, or calls `skipPastedLink()` (the person
+   moved on without pasting). If the pasted link is ours, `done` is stored by flow A and
+   matching never runs.
+3. `attempts` is 3 or more → store `done`; status `failed`. Stop.
+4. Store `attempts + 1`, before the request (the same reasoning as on Android:
+   [Crashes](#crashes-and-the-once-only-guarantee)).
+5. If a link of this app has been accepted since the process started → store `done`; status
+   `superseded`. No request.
+6. `POST {apiBaseUrl}/v1/public/deferred-links/match` with
+
+   ```json
+   {
+     "platform": "ios",
+     "bundleId": "<Bundle.main.bundleIdentifier>",
+     "deviceFamily": "iphone",
+     "locale": "en-GB",
+     "sdkVersion": "<SDK version>"
+   }
+   ```
+
+   - `deviceFamily`: `iphone`, `ipad` or `ipod`, from `UIDevice.current.userInterfaceIdiom`
+     (`.phone` is `ipod` when `UIDevice.current.model` starts with `iPod`). Any other idiom
+     (Mac, TV, Vision) → store `done`; status `unavailable`; no request.
+   - `locale`: `Locale.preferredLanguages.first`. No such value → `unavailable`, as above.
+   - **Nothing else.** No identifier for vendor or advertising, no device model or name, no
+     screen size, no OS version, no time zone, no carrier. The server takes the network address
+     from the connection. The strict schema refuses any other field.
+
+| Outcome                                                                                                                                          | Result                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| 200 with `linkId`, `appId`, `routePath` valid as for resolving, `deferred` = `true`, `matched` = `"probabilistic"`, and `url` a link of this app | Store `done`, then deliver — unless a link of this app was accepted meanwhile (`superseded`) |
+| 200 with anything else                                                                                                                           | Store `done`; status `failed`                                                                |
+| 404, any other 4xx except 429                                                                                                                    | Store `done`; status `notFound`. The usual answer: nothing fitted, or more than one did      |
+| 429, 5xx, transport failure, timeout — after the retries                                                                                         | Status `pending`; a later launch tries again, until step 3 ends it                           |
+
+A match is used up by the request that gets it. There is no grace period as for click ids: if
+the answer is lost on the way, a retry gets 404 and the link is gone.
+
+Delivery: as on Android (`isDeferred` = `true`, exactly once, never from `getInitialLink`, no
+`app_open`, a normal link wins), plus a second property on every resolved link:
+`isProbabilisticMatch` (boolean; `true` only here). **Apps must check it**: a probabilistic link
+may belong to someone else, so it must never by itself sign anyone in, accept an invitation,
+apply a personal discount or show personal content. The SDK documentation says this next to the
+property.
+
+Status values are those of [Android](#status-and-errors) plus `awaitingPaste`. Nothing is
+reported to `onError`.
+
+The iOS SDK (Swift) and Kotlin Multiplatform (`iosMain`) implement both flows natively. Flutter,
+JavaScript, React Native, Capacitor, Unity, .NET and Unreal have no native code of ours: the app
+passes the pasted text to `redeemPastedLink`, flow B needs `deviceFamily` and `locale` from the
+app (two option callbacks; .NET MAUI and Unity fill them from the framework), and the
+`pasteboardMayContainLink` step is skipped unless the app supplies it.
+
+### What deferred links on iOS send and read
+
+Flow A: the SDK reads nothing by itself. It receives a string the person pasted, sends the click
+id found in it together with the bundle id and the SDK version, and drops the string. Flow B:
+the SDK sends the bundle id, the device family, the first preferred language and the SDK
+version, and the server additionally uses the connection's IP address — which is processing of
+personal data, and identification of a device from its properties in Apple's sense. The server
+keeps only a keyed hash and deletes it within hours (see privacy). Whether the
+app needs the person's consent, what its privacy policy and App Store privacy labels must say,
+and whether App Review accepts it, are the app developer's responsibility; the SDK supports a
+consent step by doing nothing until `deferredLinks` is switched on.
+
+**Older SDK versions.** An iOS SDK without `deferredLinks` never calls either endpoint. A person
+who pastes the copied link into such an app gets nothing; a person who opens the copied link in
+a browser gets an ordinary open of the link (the `strybok_click` parameter is ignored there, and
+SDKs drop it from the URL like every other non-campaign parameter).
+
+## Which SDKs implement deferred links
+
+All versions below are **unreleased** at the time of writing (2026-11-25) and are covered by unit
+tests against fake sources and a stub transport only. Nothing has run on a device, against a
+real store, with a real pasteboard or against the production API, and the server side is not
+deployed to production yet. Everything is optional and off by default.
+
+| SDK                                     | Version | Android (store referrer)                                                                                                                                                        | iOS flow A (pasted link)                                 | iOS flow B (probabilistic matching)                                     |
+| --------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Android (Kotlin)                        | 0.4.0   | Yes, with the shipped sources for Google Play, Galaxy Store and AppGallery; the app adds the store's library as a dependency                                                    | —                                                        | —                                                                       |
+| Kotlin Multiplatform                    | 0.4.0   | Yes, the same sources in `androidMain`                                                                                                                                          | Yes (`redeemPastedLink`)                                 | Yes, only with `allowProbabilisticMatching`                             |
+| iOS (Swift)                             | 0.4.0   | —                                                                                                                                                                               | Yes (`redeemPastedLink`)                                 | Yes, only with `allowProbabilisticMatching`                             |
+| Flutter                                 | 0.3.0   | The flow; the app supplies the referrer string and the state store                                                                                                              | The flow; the app supplies the pasted text and the store | The flow; the app also supplies device family and language              |
+| JavaScript, React Native, Capacitor     | 0.3.0   | The flow; the app supplies the referrer string and the state store                                                                                                              | The flow; the app supplies the pasted text and the store | The flow; the app also supplies device family and language              |
+| Unity, .NET (`Strybok`, `Strybok.Maui`) | 0.3.0   | The flow; the app supplies the referrer string (state: `PlayerPrefs` in Unity and MAUI `Preferences` in `Strybok.Maui` by default; the plain .NET package has no default store) | The flow; the app supplies the pasted text               | The flow; device family and language are filled by default, replaceable |
+| Unreal Engine                           | 0.3.0   | The flow; the game supplies the referrer string from C++                                                                                                                        | The flow; the game supplies the pasted text              | The flow; the game supplies device family and language from C++         |
+
+Of the three store sources only Google Play's is written against the vendor's documentation;
+Galaxy Store and AppGallery are **unverified** (see
+[Sources shipped with the Android SDK](#sources-shipped-with-the-android-sdk)). Flow B also
+needs the service to have a matching secret, the owner's setting and a per-link permission; a
+service without the secret answers that matching is not available. No flow is automatic on iOS:
+flow A needs the person to copy and paste, flow B guesses and is forbidden by Apple's rules.
+
 ## Errors
 
 | Kind                  | When                                                                       |
@@ -376,13 +902,22 @@ token is readable only by Google.
 | `AttestationRequired` | `createLink` only, SDKs with [attestation](#attestation-optional) support. |
 | `AttestationFailed`   | `createLink` only, SDKs with attestation support.                          |
 
-Every error carries the URL being handled when known.
+Every error carries the URL being handled when known. The deferred-link check reports no errors
+at all, only a [status](#status-and-errors).
 
 ## Privacy
 
 SDKs collect no device identifiers, no advertising IDs and no fingerprint. The only data sent is
-the link host and slug (resolve), the event above, and — only when the app calls `createLink` —
+the link host and slug plus the five `utm_*` campaign parameters of the tapped URL when they pass
+the character rule (resolve) — never any other query parameter or the fragment —, the event
+above, and — only when the app calls `createLink` —
 the client key and the route, payload, title, description and image URL the app passed in. Apps
 must not put personal data in a route or payload: whoever receives the link can read them. With
 `attestation` switched on, `createLink` also sends what
-[Attestation](#what-attestation-sends) lists.
+[Attestation](#what-attestation-sends) lists. With `deferredLinks` switched on, the SDK also
+reads the store's install referrer and sends what
+[Deferred links](#what-deferred-links-send-and-read) lists (Android), or sends what
+[Deferred links on iOS](#what-deferred-links-on-ios-send-and-read) lists. The one exception to
+the first sentence of this section is iOS probabilistic matching, which exists only behind
+`allowProbabilisticMatching`: there the server identifies the device by its network address and
+two coarse properties.

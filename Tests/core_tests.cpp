@@ -57,6 +57,17 @@ int gFailuresInTest = 0;
 [[maybe_unused]] std::string ToText(unsigned long value) { return std::to_string(value); }
 [[maybe_unused]] std::string ToText(unsigned long long value) { return std::to_string(value); }
 [[maybe_unused]] std::string ToText(ErrorKind value) { return "ErrorKind#" + std::to_string(static_cast<int>(value)); }
+[[maybe_unused]] std::string ToText(DeferredLinkStatus value)
+{
+	static const char* const kNames[] = {"Disabled", "Checking", "Pending", "NotFirstLaunch", "Unavailable", "NoReferrer",
+		"NotFound", "Superseded", "Delivered", "Failed", "AwaitingPaste"};
+	return kNames[static_cast<int>(value)];
+}
+[[maybe_unused]] std::string ToText(PastedLinkResult value)
+{
+	static const char* const kNames[] = {"Delivered", "NotOurs", "NotFound", "AlreadyHandled", "Disabled", "Failed", "<none>"};
+	return kNames[static_cast<int>(value)];
+}
 
 void ReportFailure(const char* file, int line, const std::string& what)
 {
@@ -276,6 +287,10 @@ public:
 	std::vector<HttpRequest> creates;
 	std::vector<std::uint64_t> createIds;
 	std::vector<std::uint64_t> cancelled;
+	/** Requests to the deferred-link endpoints (redeem and match); answered with 404 by default. */
+	std::function<Reply(const HttpRequest&)> onDeferred;
+	std::vector<HttpRequest> deferred;
+	std::vector<std::uint64_t> deferredIds;
 
 	std::uint64_t Send(const HttpRequest& request, Callback onDone) override
 	{
@@ -286,8 +301,15 @@ public:
 		const std::string linksSuffix = "/v1/public/links";
 		const bool isCreate = request.url.size() >= linksSuffix.size() &&
 			request.url.compare(request.url.size() - linksSuffix.size(), linksSuffix.size(), linksSuffix) == 0;
+		const bool isDeferred = request.url.find("/v1/public/deferred-links/") != std::string::npos;
 		Reply reply;
-		if (isEvent)
+		if (isDeferred)
+		{
+			deferred.push_back(request);
+			deferredIds.push_back(id);
+			reply = onDeferred ? onDeferred(request) : Respond(404);
+		}
+		else if (isEvent)
 		{
 			events.push_back(request);
 			reply = onEvent ? onEvent() : Respond(202);
@@ -1505,7 +1527,7 @@ TEST(Events, SendsOneMinimalBestEffortEventPerDeliveredLink) // [ref]
 	EXPECT_EQ(StringMember(event, "type"), "app_open");
 	EXPECT_EQ(StringMember(event, "linkId"), "link_1");
 	EXPECT_EQ(StringMember(event, "platform"), "ios");
-	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.2.0");
+	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.3.0");
 	EXPECT_MSG(IsUuidV4(StringMember(event, "eventId")), StringMember(event, "eventId"));
 }
 
@@ -1599,8 +1621,8 @@ TEST(Events, UuidFormattingForcesVersionAndVariant)
 
 TEST(Events, BodyIsExactAndEscapedAndTheVersionIsCapped)
 {
-	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "0.2.0"),
-		"{\"eventId\":\"id-1\",\"linkId\":\"link_1\",\"type\":\"app_open\",\"platform\":\"android\",\"sdkVersion\":\"0.2.0\"}");
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "0.3.0"),
+		"{\"eventId\":\"id-1\",\"linkId\":\"link_1\",\"type\":\"app_open\",\"platform\":\"android\",\"sdkVersion\":\"0.3.0\"}");
 
 	json::Value event;
 	EXPECT(json::Parse(BuildAppOpenBody("id", "li\"nk\\\n", "unknown", std::string(40, 'v')), event));
@@ -1610,7 +1632,7 @@ TEST(Events, BodyIsExactAndEscapedAndTheVersionIsCapped)
 
 	EXPECT(json::Parse(BuildAppOpenBody("id", "l", "ios", ""), event));
 	EXPECT_EQ(StringMember(event, "sdkVersion"), std::string(kSdkVersion));
-	EXPECT_EQ(std::string(kSdkVersion), "0.2.0");
+	EXPECT_EQ(std::string(kSdkVersion), "0.3.0");
 }
 
 TEST(Events, AnInjectedRandomSourceIsUsed)
@@ -1782,6 +1804,456 @@ TEST(Dispose, DestroyingTheEngineFromInsideAnErrorHandlerIsSafe)
 	bridge.loop.Advance(10000);
 	EXPECT_EQ(calls, 1);
 	EXPECT(bridge.sdk == nullptr);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Campaign values ("Campaign query" in the SDK contract, decision 0018)
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+/** The lookup URL for `url`, or "<not ours>". */
+std::string LookupOf(const std::string& url)
+{
+	std::string lookup;
+	return BuildLookupUrl(url, Hosts(), lookup) ? lookup : std::string("<not ours>");
+}
+
+std::string ResolvedBody(const std::string& campaign)
+{
+	return "{\"linkId\":\"link_1\",\"appId\":\"app_1\",\"routePath\":\"/x\"" +
+		(campaign.empty() ? std::string() : ",\"campaign\":" + campaign) + "}";
+}
+
+std::string Repeat(const std::string& text, int times)
+{
+	std::string result;
+	for (int index = 0; index < times; ++index)
+	{
+		result += text;
+	}
+	return result;
+}
+
+} // namespace
+
+TEST(Campaign, TheExampleOfTheContract)
+{
+	std::string lookup;
+	EXPECT(BuildLookupUrl(
+		"https://MyApp.strybok.link/invite777?utm_source=instagram&fbclid=abc&utm_medium=two%20words&utm_source=x#top",
+		NormalizeHosts({"myapp.strybok.link"}), lookup));
+	EXPECT_EQ(lookup, "https://myapp.strybok.link/invite777?utm_source=instagram");
+}
+
+TEST(Campaign, WithoutCampaignParametersTheLookupIsWhatEarlierVersionsSent)
+{
+	const std::vector<std::string> suffixes = {
+		"",
+		"?",
+		"#utm_source=fragment",
+		"?#utm_source=fragment",
+		"?token=secret&fbclid=abc&gclid=1&utm_id=7#f",
+		"?a=1#?utm_source=fragment",
+		"?utm_source=",
+		"?utm_source",
+		"?&&=&=x&",
+	};
+	for (const std::string& suffix : suffixes)
+	{
+		EXPECT_MSG(LookupOf(kInvite + suffix) == kInvite, suffix);
+	}
+	EXPECT_EQ(BuildCampaignQuery(""), "");
+	EXPECT_EQ(BuildCampaignQuery("&"), "");
+	EXPECT_EQ(BuildCampaignQuery("="), "");
+	EXPECT_EQ(BuildCampaignQuery("&=&&"), "");
+}
+
+TEST(Campaign, KeepsTheFiveKeysInTheFixedOrderAndNothingElse)
+{
+	EXPECT_EQ(
+		LookupOf(kInvite + "?utm_content=n&x=1&utm_term=t&utm_campaign=c&token=secret&utm_medium=m&utm_source=s#utm_source=f"),
+		kInvite + "?utm_source=s&utm_medium=m&utm_campaign=c&utm_term=t&utm_content=n");
+	EXPECT_EQ(LookupOf(kInvite + "?utm_content=n&&utm_medium=m&"), kInvite + "?utm_medium=m&utm_content=n");
+	EXPECT_EQ(LookupOf(kInvite + "?utm_source=a#b"), kInvite + "?utm_source=a");
+	EXPECT_EQ(BuildCampaignQuery("utm_term=t"), "?utm_term=t");
+}
+
+TEST(Campaign, KeyNamesAreExactAndLowerCase)
+{
+	const std::vector<std::string> queries = {
+		"UTM_SOURCE=a",
+		"Utm_Source=a",
+		"utm_sourcex=a",
+		"xutm_source=a",
+		"utm_id=a",
+		"utm_source%20=a",
+		"+utm_source=a",
+		" utm_source=a",
+		"utm_source[]=a",
+		std::string("utm_source\0=a", 13),
+	};
+	for (const std::string& query : queries)
+	{
+		EXPECT_MSG(BuildCampaignQuery(query).empty(), query);
+	}
+}
+
+TEST(Campaign, TheFirstOccurrenceOfAKeyCountsEvenWhenItsValueIsDropped)
+{
+	EXPECT_EQ(BuildCampaignQuery("utm_source=first&utm_source=second"), "?utm_source=first");
+	EXPECT_EQ(BuildCampaignQuery("utm_source=not%20valid&utm_source=second"), "");
+	EXPECT_EQ(BuildCampaignQuery("utm_source=&utm_source=second"), "");
+	EXPECT_EQ(BuildCampaignQuery("utm_source&utm_source=second"), "");
+	EXPECT_EQ(BuildCampaignQuery("utm_source=a%2Fb&utm_medium=m&utm_source=second"), "?utm_medium=m");
+}
+
+TEST(Campaign, ValuesOutsideTheAllowedCharactersOrLengthAreDropped)
+{
+	const std::vector<std::string> values = {
+		"two%20words",
+		"two+words",
+		"two words",
+		"a@b.c",
+		"a%40b.c",
+		"a/b",
+		"a%2Fb",
+		"a=b",
+		"a%26utm_medium=b",
+		"a%3Db",
+		"(other)",
+		"a,b",
+		"a:b",
+		"a*b",
+		"a!b",
+		"a'b",
+		"a\"b",
+		"<script>",
+		"\xD0\xBA\xD0\xB0\xD0\xBC\xD0\xBF", // Cyrillic, raw UTF-8
+		"%D0%BA%D0%B0",
+		"caf%C3%A9",
+		"a%00b",
+		std::string("a\0b", 3),
+		"a%0Ab",
+		"a\nb",
+		"a\x7F",
+		std::string(65, 'a'),
+	};
+	for (const std::string& value : values)
+	{
+		EXPECT_MSG(BuildCampaignQuery("utm_source=" + value).empty(), value);
+	}
+	const std::string longest(64, 'a');
+	EXPECT_EQ(BuildCampaignQuery("utm_source=" + longest), "?utm_source=" + longest);
+	EXPECT_EQ(BuildCampaignQuery("utm_source=AZaz09._~-"), "?utm_source=AZaz09._~-");
+}
+
+TEST(Campaign, PercentEncodedKeysAndValuesAreDecoded)
+{
+	EXPECT_EQ(BuildCampaignQuery("utm_source=%69nsta%2Dgram"), "?utm_source=insta-gram");
+	EXPECT_EQ(BuildCampaignQuery("utm_source=a%2e%5f%7Eb"), "?utm_source=a._~b");
+	EXPECT_EQ(BuildCampaignQuery("utm%5Fsource=x"), "?utm_source=x");
+	EXPECT_EQ(BuildCampaignQuery("%75tm_medium=x"), "?utm_medium=x");
+	// 64 characters after decoding.
+	const std::string encoded = Repeat("%61", 64);
+	EXPECT_EQ(BuildCampaignQuery("utm_term=" + encoded), "?utm_term=" + std::string(64, 'a'));
+	EXPECT_EQ(BuildCampaignQuery("utm_term=" + encoded + "%61"), "");
+}
+
+TEST(Campaign, MalformedEscapesAndInvalidUtf8DropTheValueAndNeverCrash)
+{
+	const std::vector<std::string> values = {
+		"%",
+		"a%",
+		"a%2",
+		"%2",
+		"%zz",
+		"%G0",
+		"%0G",
+		"a%-1",
+		"%+1",
+		"%%",
+		"%%%",
+		"%u0041",
+		"%C3%28",       // invalid continuation byte
+		"%FF",          // never valid in UTF-8
+		"%C0%AE",       // overlong "."
+		"%E2%82",       // truncated sequence
+		"%ED%A0%80",    // encoded surrogate
+		"%F4%90%80%80", // beyond U+10FFFF
+		"\xC3\x28",     // the same, as raw bytes
+		"\xFF",
+		"\xC0\xAE",
+		"\xE2\x82",
+		"\x80",
+		"a\xFF\xFE",
+	};
+	for (const std::string& value : values)
+	{
+		EXPECT_MSG(BuildCampaignQuery("utm_source=" + value).empty(), value);
+		EXPECT_MSG(BuildCampaignQuery("utm_source=" + value + "&utm_medium=ok") == "?utm_medium=ok", value);
+		EXPECT_MSG(BuildCampaignQuery(value + "=x&utm_medium=ok") == "?utm_medium=ok", value);
+		EXPECT_MSG(LookupOf(kInvite + "?utm_source=" + value) == kInvite, value);
+	}
+	// An escape must not read past the end of its own parameter.
+	EXPECT_EQ(BuildCampaignQuery("utm_source=a%4&1=x"), "");
+	EXPECT_EQ(BuildCampaignQuery("utm_source=%&41"), "");
+	EXPECT_EQ(BuildCampaignQuery("utm_source%3"), "");
+	EXPECT_EQ(BuildCampaignQuery("%"), "");
+	EXPECT_EQ(BuildCampaignQuery("%4"), "");
+}
+
+TEST(Campaign, AQueryChangesNeitherWhichUrlsAreOursNorTheHostAndPathThatAreUsed)
+{
+	const std::vector<std::string> hosts = Hosts();
+	const std::string query = "?utm_source=a&utm_medium=b";
+	const std::vector<std::string> foreign = {
+		"http://my-app.strybok.link/invite777",
+		"https://evil.example.com/invite777",
+		"https://user:pw@my-app.strybok.link/invite777",
+		"https://user@my-app.strybok.link/invite777",
+		"https://my-app.strybok.link:8443/invite777",
+		"https://my-app.strybok.link/a/b",
+		"https://my-app.strybok.link/invite777/",
+		"https://my-app.strybok.link/",
+		"https://my-app.strybok.link",
+		"https://my-app.strybok.link/" + std::string(65, 'a'),
+	};
+	for (const std::string& url : foreign)
+	{
+		EXPECT_MSG(!IsStrybokUrl(url, hosts), url);
+		EXPECT_MSG(!IsStrybokUrl(url + query, hosts), url + query);
+		EXPECT_MSG(LookupOf(url + query) == "<not ours>", url + query);
+	}
+	// Nothing in a query can stand in for the authority or the path.
+	const std::vector<std::string> tricky = {
+		"https://evil.example.com/x?utm_source=https://my-app.strybok.link/invite777",
+		"https://evil.example.com?utm_source=a@my-app.strybok.link/invite777",
+		"https://my-app.strybok.link?utm_source=/invite777",
+		"https://my-app.strybok.link/?utm_source=a",
+	};
+	for (const std::string& url : tricky)
+	{
+		EXPECT_MSG(!IsStrybokUrl(url, hosts), url);
+	}
+	// Accepted with and without a query alike, and host and slug are the same either way.
+	EXPECT(IsStrybokUrl(kInvite, hosts));
+	EXPECT(IsStrybokUrl(kInvite + query, hosts));
+	EXPECT_EQ(LookupOf("HTTPS://My-App.STRYBOK.link:443/Invite777?utm_source=a&token=s#f"),
+		"https://my-app.strybok.link/Invite777?utm_source=a");
+}
+
+TEST(Campaign, ResolveSendsTheCampaignQueryAndNothingElseOfTheQuery)
+{
+	Bridge bridge;
+	const std::string url =
+		"https://My-App.Strybok.Link/invite777?token=secret&utm_medium=social&utm_source=instagram&email=a%40b.c#private";
+	const Bridge::ResolveOutcome outcome = bridge.Resolve(url);
+	EXPECT(outcome.ok);
+	EXPECT_EQ(outcome.link.uri, url);
+
+	EXPECT_EQ(bridge.api.resolves.size(), static_cast<std::size_t>(1));
+	const std::string& sent = bridge.api.resolves[0].url;
+	EXPECT_EQ(sent, kResolvePrefix +
+		"https%3A%2F%2Fmy-app.strybok.link%2Finvite777%3Futm_source%3Dinstagram%26utm_medium%3Dsocial");
+	for (const char* secret : {"secret", "token", "email", "private", "b.c"})
+	{
+		EXPECT_MSG(sent.find(secret) == std::string::npos, secret);
+	}
+}
+
+TEST(Campaign, AUrlWithoutCampaignParametersIsRequestedExactlyAsBefore)
+{
+	Bridge bridge;
+	EXPECT(bridge.Resolve(kInvite).ok);
+	EXPECT(bridge.Resolve(kInvite + "?token=secret&utm_source=two%20words#f").ok);
+	EXPECT_EQ(bridge.api.resolves.size(), static_cast<std::size_t>(2));
+	const std::string expected = kResolvePrefix + "https%3A%2F%2Fmy-app.strybok.link%2Finvite777";
+	EXPECT_EQ(bridge.api.resolves[0].url, expected);
+	EXPECT_EQ(bridge.api.resolves[1].url, expected);
+}
+
+TEST(Campaign, ResolvedLinkHoldsTheFiveStringFieldsTheServerSent)
+{
+	ResolvedLink link;
+	EXPECT(ParseResolveBody(kInvite, ResolvedBody(
+		"{\"source\":\"instagram\",\"medium\":\"social\",\"campaign\":\"spring\",\"term\":\"shoes\",\"content\":\"banner\",\"extra\":\"x\"}"),
+		link));
+	EXPECT_EQ(link.campaign.source, "instagram");
+	EXPECT_EQ(link.campaign.medium, "social");
+	EXPECT_EQ(link.campaign.campaign, "spring");
+	EXPECT_EQ(link.campaign.term, "shoes");
+	EXPECT_EQ(link.campaign.content, "banner");
+	EXPECT(!link.campaign.IsEmpty());
+
+	// A later answer without values does not keep the earlier ones.
+	EXPECT(ParseResolveBody(kInvite, ResolvedBody(""), link));
+	EXPECT(link.campaign.IsEmpty());
+}
+
+TEST(Campaign, IsEmptyWhenMissingOrNotAnObjectAndOddFieldsAreIgnored)
+{
+	const std::vector<std::string> campaigns = {
+		"", "null", "[]", "[\"a\"]", "\"instagram\"", "7", "true", "{}", "{\"other\":\"x\"}", "{\"source\":\"\"}",
+	};
+	for (const std::string& campaign : campaigns)
+	{
+		ResolvedLink link;
+		EXPECT_MSG(ParseResolveBody(kInvite, ResolvedBody(campaign), link), campaign);
+		EXPECT_MSG(link.campaign.IsEmpty(), campaign);
+		EXPECT_EQ(link.routePath, "/x");
+	}
+
+	ResolvedLink link;
+	EXPECT(ParseResolveBody(kInvite, ResolvedBody(
+		"{\"source\":7,\"medium\":null,\"campaign\":{\"a\":1},\"term\":[\"x\"],\"content\":\"banner\",\"utm_source\":\"x\"}"),
+		link));
+	EXPECT_EQ(link.campaign.source, "");
+	EXPECT_EQ(link.campaign.medium, "");
+	EXPECT_EQ(link.campaign.campaign, "");
+	EXPECT_EQ(link.campaign.term, "");
+	EXPECT_EQ(link.campaign.content, "banner");
+
+	// The same through the response classification: never an error.
+	HttpResponse response;
+	response.transportOk = true;
+	response.statusCode = 200;
+	response.body = ResolvedBody("[1,2]");
+	const AttemptResult result = ClassifyResolveResponse(kInvite, response);
+	EXPECT(result.action == AttemptAction::Deliver);
+	EXPECT(result.link.campaign.IsEmpty());
+}
+
+TEST(Campaign, AppOpenReportsTheCampaignExactlyAsResolveReturnedIt)
+{
+	Bridge bridge;
+	// The server answers with other values than the URL has: the answer is what is reported.
+	bridge.api.onResolve = [](const HttpRequest&) {
+		return Respond(200, ResolvedBody("{\"source\":\"newsletter\",\"content\":\"footer\",\"ignored\":\"x\",\"term\":5}"));
+	};
+	bridge.Listen();
+	EXPECT(bridge.Initialize());
+	bridge.sdk->HandleUrl(kInvite + "?utm_source=instagram&utm_medium=social");
+	bridge.loop.Settle();
+
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(1));
+	EXPECT_EQ(bridge.received[0].campaign.source, "newsletter");
+	EXPECT_EQ(bridge.received[0].campaign.content, "footer");
+	EXPECT_EQ(bridge.received[0].campaign.medium, "");
+	EXPECT_EQ(bridge.received[0].campaign.term, "");
+
+	EXPECT_EQ(bridge.api.events.size(), static_cast<std::size_t>(1));
+	json::Value event;
+	EXPECT(json::Parse(bridge.api.events[0].body, event));
+	EXPECT_EQ(event.members.size(), static_cast<std::size_t>(6));
+	const json::Value* campaign = event.Find("campaign");
+	EXPECT(campaign != nullptr && campaign->type == json::Type::Object);
+	if (campaign != nullptr)
+	{
+		EXPECT_EQ(campaign->members.size(), static_cast<std::size_t>(2));
+		EXPECT_EQ(StringMember(*campaign, "source"), "newsletter");
+		EXPECT_EQ(StringMember(*campaign, "content"), "footer");
+	}
+	const std::string& body = bridge.api.events[0].body;
+	const std::string tail = ",\"campaign\":{\"source\":\"newsletter\",\"content\":\"footer\"}}";
+	EXPECT(body.size() > tail.size() && body.compare(body.size() - tail.size(), tail.size(), tail) == 0);
+}
+
+TEST(Campaign, AQueuedLinkReportsItsCampaignToo)
+{
+	Bridge bridge;
+	bridge.api.onResolve = [](const HttpRequest&) { return Respond(200, ResolvedBody("{\"medium\":\"email\"}")); };
+	EXPECT(bridge.Initialize(kInvite)); // nobody listens: the link is queued
+	EXPECT_EQ(bridge.api.events.size(), static_cast<std::size_t>(1));
+	json::Value event;
+	EXPECT(json::Parse(bridge.api.events[0].body, event));
+	const json::Value* campaign = event.Find("campaign");
+	EXPECT(campaign != nullptr);
+	if (campaign != nullptr)
+	{
+		EXPECT_EQ(StringMember(*campaign, "medium"), "email");
+	}
+	bridge.Listen();
+	bridge.loop.Settle();
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(1));
+	EXPECT_EQ(bridge.received[0].campaign.medium, "email");
+}
+
+TEST(Campaign, AppOpenHasNoCampaignWhenResolveReturnedNoneWhateverTheUrlSays)
+{
+	const std::vector<std::string> campaigns = {"", "{}", "null", "[]", "{\"source\":1}"};
+	for (const std::string& campaign : campaigns)
+	{
+		Bridge bridge;
+		bridge.api.onResolve = [campaign](const HttpRequest&) { return Respond(200, ResolvedBody(campaign)); };
+		bridge.Listen();
+		EXPECT(bridge.Initialize());
+		bridge.sdk->HandleUrl(kInvite + "?utm_source=instagram");
+		bridge.loop.Settle();
+
+		EXPECT_EQ(bridge.api.events.size(), static_cast<std::size_t>(1));
+		if (bridge.api.events.size() == 1)
+		{
+			json::Value event;
+			EXPECT(json::Parse(bridge.api.events[0].body, event));
+			EXPECT_MSG(event.members.size() == 5, campaign);
+			EXPECT_MSG(event.Find("campaign") == nullptr, campaign);
+			EXPECT_MSG(bridge.api.events[0].body.find("instagram") == std::string::npos, campaign);
+		}
+	}
+}
+
+TEST(Campaign, AppOpenBodyIsExactWithAndWithoutCampaign)
+{
+	const std::string base =
+		"{\"eventId\":\"id-1\",\"linkId\":\"link_1\",\"type\":\"app_open\",\"platform\":\"android\",\"sdkVersion\":\"1.2.3\"";
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "1.2.3"), base + "}");
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "1.2.3", Campaign()), base + "}");
+
+	Campaign all;
+	all.source = "s";
+	all.medium = "m";
+	all.campaign = "c";
+	all.term = "t";
+	all.content = "n";
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "1.2.3", all),
+		base + ",\"campaign\":{\"source\":\"s\",\"medium\":\"m\",\"campaign\":\"c\",\"term\":\"t\",\"content\":\"n\"}}");
+
+	Campaign one;
+	one.term = "t\"x";
+	EXPECT_EQ(BuildAppOpenBody("id-1", "link_1", "android", "1.2.3", one), base + ",\"campaign\":{\"term\":\"t\\\"x\"}}");
+}
+
+TEST(Campaign, TheSameSlugWithDifferentCampaignParametersIsTwoLinks)
+{
+	Bridge bridge;
+	bridge.Listen();
+	EXPECT(bridge.Initialize());
+
+	bridge.sdk->HandleUrl(kInvite + "?utm_source=a");
+	bridge.sdk->HandleUrl(kInvite + "?utm_source=a"); // the same URL string: one tap reported twice
+	bridge.sdk->HandleUrl(kInvite + "?utm_source=b");
+	bridge.sdk->HandleUrl(kInvite);
+	// Compared as received: a parameter that is never sent still makes another URL.
+	bridge.sdk->HandleUrl(kInvite + "?fbclid=1");
+	bridge.sdk->HandleUrl(kInvite + "?fbclid=1");
+	bridge.loop.Settle();
+
+	EXPECT_EQ(bridge.received.size(), static_cast<std::size_t>(4));
+	EXPECT_EQ(bridge.api.resolves.size(), static_cast<std::size_t>(4));
+	if (bridge.api.resolves.size() == 4 && bridge.received.size() == 4)
+	{
+		const std::string plain = kResolvePrefix + "https%3A%2F%2Fmy-app.strybok.link%2Finvite777";
+		EXPECT_EQ(bridge.api.resolves[0].url, plain + "%3Futm_source%3Da");
+		EXPECT_EQ(bridge.api.resolves[1].url, plain + "%3Futm_source%3Db");
+		EXPECT_EQ(bridge.api.resolves[2].url, plain);
+		EXPECT_EQ(bridge.api.resolves[3].url, plain);
+		EXPECT_EQ(bridge.received[0].uri, kInvite + "?utm_source=a");
+		EXPECT_EQ(bridge.received[1].uri, kInvite + "?utm_source=b");
+		EXPECT_EQ(bridge.received[2].uri, kInvite);
+		EXPECT_EQ(bridge.received[3].uri, kInvite + "?fbclid=1");
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2645,6 +3117,1691 @@ TEST(CreateLink, DestroyingTheCreatorFromInsideItsCallbackIsSafe)
 	retrying.creator.reset();
 	retrying.loop.Advance(10000);
 	EXPECT_EQ(retrying.loop.TaskCount(), static_cast<std::size_t>(0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// deferred links (SDK contract, "Deferred links (optional, Android)" and "Deferred links on iOS")
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+const std::string kClick = "dc_0123456789abcdefghijABCDEFGHIJ01";
+const std::string kOtherClick = "dc_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+const std::string kRedeemUrl = "https://api.strybok.com/v1/public/deferred-links/redeem";
+const std::string kMatchUrl = "https://api.strybok.com/v1/public/deferred-links/match";
+const std::string kPackage = "com.example.game";
+const std::string kBundle = "com.example.Game";
+const std::string kPasted = "https://my-app.strybok.link/invite777?strybok_click=" + kClick;
+
+/** Survives a "restart": the same store is handed to the next engine. */
+class MemoryStore final : public IDeferredLinkStore
+{
+public:
+	std::map<std::string, std::string> values;
+	/** Every write, as `key=value`, in order. */
+	std::vector<std::string> writes;
+	int reads = 0;
+	bool failReads = false;
+	/** Writes to this key fail. */
+	std::string failWritesTo;
+
+	bool Read(const std::string& key, std::string& outValue, bool& outFound) override
+	{
+		++reads;
+		if (failReads)
+		{
+			return false;
+		}
+		const auto found = values.find(key);
+		outFound = found != values.end();
+		outValue = outFound ? found->second : std::string();
+		return true;
+	}
+
+	bool Write(const std::string& key, const std::string& value) override
+	{
+		if (key == failWritesTo)
+		{
+			return false;
+		}
+		values[key] = value;
+		writes.push_back(key + "=" + value);
+		return true;
+	}
+
+	std::string Get(const std::string& key) const
+	{
+		const auto found = values.find(key);
+		return found == values.end() ? std::string("<none>") : found->second;
+	}
+
+	std::string Attempts() const { return Get(kDeferredAttemptsKey); }
+	bool Done() const { return Get(kDeferredDoneKey) == "1"; }
+};
+
+InstallReferrerAnswer Referrer(const std::string& referrer)
+{
+	InstallReferrerAnswer answer;
+	answer.kind = InstallReferrerAnswer::Kind::Referrer;
+	answer.referrer = referrer;
+	return answer;
+}
+
+InstallReferrerAnswer ForNow()
+{
+	InstallReferrerAnswer answer;
+	answer.kind = InstallReferrerAnswer::Kind::UnavailableForNow;
+	return answer;
+}
+
+InstallReferrerAnswer Never()
+{
+	InstallReferrerAnswer answer;
+	answer.kind = InstallReferrerAnswer::Kind::Unavailable;
+	return answer;
+}
+
+/** A source that answers before returning. */
+InstallReferrerSource Answering(const InstallReferrerAnswer& answer, int* calls = nullptr)
+{
+	return [answer, calls](std::function<void(const InstallReferrerAnswer&)> done) {
+		if (calls != nullptr)
+		{
+			++*calls;
+		}
+		done(answer);
+	};
+}
+
+/** A source that keeps the question until the test answers it. */
+struct HeldSource
+{
+	std::shared_ptr<std::vector<std::function<void(const InstallReferrerAnswer&)>>> questions =
+		std::make_shared<std::vector<std::function<void(const InstallReferrerAnswer&)>>>();
+
+	InstallReferrerSource Source() const
+	{
+		const auto held = questions;
+		return [held](std::function<void(const InstallReferrerAnswer&)> done) { held->push_back(std::move(done)); };
+	}
+
+	std::size_t Asked() const { return questions->size(); }
+	void Answer(const InstallReferrerAnswer& answer) const { questions->back()(answer); }
+};
+
+std::string DeferredBody(
+	const std::string& url = "https://my-app.strybok.link/invite777", const std::string& extra = std::string())
+{
+	return "{\"linkId\":\"link_d\",\"appId\":\"app_1\",\"routePath\":\"/invite/abc123\","
+		"\"payload\":{\"invitationId\":\"abc123\"},\"campaign\":{\"source\":\"instagram\"},"
+		"\"url\":\"" + url + "\",\"deferred\":true" + extra + "}";
+}
+
+std::string MatchedBody()
+{
+	return DeferredBody("https://my-app.strybok.link/invite777", ",\"matched\":\"probabilistic\"");
+}
+
+std::string HeaderOf(const HttpRequest& request, const std::string& name)
+{
+	for (const auto& header : request.headers)
+	{
+		if (header.first == name)
+		{
+			return header.second;
+		}
+	}
+	return "<missing>";
+}
+
+/** An engine with deferred links switched on, wired to fakes. `config` may be changed before `Make`. */
+struct Deferred
+{
+	FakeLoop loop;
+	FakeApi api{loop};
+	std::shared_ptr<MemoryStore> store;
+	Config config;
+	std::vector<ResolvedLink> received;
+	std::vector<LinkError> errors;
+	std::vector<DeferredLinkStatus> statuses;
+	std::vector<PastedLinkResult> pasted;
+	std::unique_ptr<LinkEngine> sdk;
+
+	explicit Deferred(const std::string& platform = "android", std::shared_ptr<MemoryStore> existing = nullptr)
+		: store(existing ? std::move(existing) : std::make_shared<MemoryStore>())
+	{
+		config.apiBaseUrl = kApi;
+		config.allowedHosts = {kHost};
+		config.timeoutMs = 60;
+		config.maxRetries = 2;
+		config.retryDelayMs = 1;
+		config.platform = platform;
+		config.deferredLinks = true;
+		config.androidPackageName = kPackage;
+		config.iosBundleId = kBundle;
+		config.deferredLinkStore = store;
+		config.deviceFamily = []() { return std::string("iphone"); };
+		config.locale = []() { return std::string("en-GB"); };
+	}
+
+	LinkEngine& Make()
+	{
+		sdk.reset(new LinkEngine(config, api, loop, loop));
+		sdk->SetErrorHandler([this](const LinkError& error) { errors.push_back(error); });
+		sdk->SetDeferredLinkStatusHandler([this](DeferredLinkStatus status) { statuses.push_back(status); });
+		return *sdk;
+	}
+
+	void Listen()
+	{
+		if (!sdk)
+		{
+			Make();
+		}
+		sdk->SetLinkHandler([this](const ResolvedLink& link) { received.push_back(link); });
+		sdk->SetListening(true);
+	}
+
+	/** Makes the engine if needed, starts it and lets the check run. Returns whether start became ready. */
+	bool Start(const std::string& launchUrl = std::string())
+	{
+		if (!sdk)
+		{
+			Make();
+		}
+		bool ready = false;
+		sdk->Start(launchUrl.empty() ? nullptr : &launchUrl, [&ready]() { ready = true; });
+		loop.Settle();
+		return ready;
+	}
+
+	void Paste(const std::string& text)
+	{
+		sdk->RedeemPastedLink(text, [this](PastedLinkResult result) { pasted.push_back(result); });
+	}
+
+	DeferredLinkStatus Status() const { return sdk->GetDeferredLinkStatus(); }
+};
+
+std::size_t Count(std::size_t value) { return value; }
+
+} // namespace
+
+TEST(DeferredParsing, FindsTheClickIdInAReferrer)
+{
+	std::string id;
+	EXPECT(FindClickIdInReferrer("strybok_click=" + kClick, id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(FindClickIdInReferrer("utm_source=x&strybok_click=" + kClick + "&utm_medium=y", id));
+	EXPECT_EQ(id, kClick);
+	// The first part with the key decides, also when its value is unusable.
+	EXPECT(FindClickIdInReferrer("strybok_click=" + kClick + "&strybok_click=" + kOtherClick, id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(!FindClickIdInReferrer("strybok_click=bad&strybok_click=" + kClick, id));
+	EXPECT(!FindClickIdInReferrer("strybok_click&strybok_click=" + kClick, id));
+
+	EXPECT(!FindClickIdInReferrer("", id));
+	EXPECT(!FindClickIdInReferrer("utm_source=google-play&utm_medium=organic", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=dc_short", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=" + kClick + "x", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=xc_0123456789abcdefghijABCDEFGHIJ01", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=dc_0123456789abcdefghijABCDEFGHIJ0-", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click=dc_0123456789abcdefghijABCDEFGHIJ0%31", id));
+	// Other keys that merely contain ours.
+	EXPECT(!FindClickIdInReferrer("xstrybok_click=" + kClick, id));
+	EXPECT(!FindClickIdInReferrer("strybok_clicks=" + kClick, id));
+	EXPECT(!FindClickIdInReferrer("STRYBOK_CLICK=" + kClick, id));
+	EXPECT(!FindClickIdInReferrer("x=strybok_click=" + kClick, id));
+	EXPECT_EQ(id, "");
+}
+
+TEST(DeferredParsing, DecodesAStillEncodedReferrerOnce)
+{
+	std::string id;
+	EXPECT(FindClickIdInReferrer("strybok_click%3D" + kClick, id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(FindClickIdInReferrer("strybok_click%3d" + kClick + "%26utm_source%3Dx", id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(FindClickIdInReferrer("utm_source%3Dx%26STRYBOK_click%3D" + kClick, id) == false); // decoded key is not ours
+	EXPECT(FindClickIdInReferrer("utm_source%3Dx%26strybok_click%3D" + kClick, id));
+	EXPECT_EQ(id, kClick);
+	// A malformed escape anywhere: no id, never an error.
+	EXPECT(!FindClickIdInReferrer("strybok_click%3D" + kClick + "%2", id));
+	EXPECT(!FindClickIdInReferrer("strybok_click%3D" + kClick + "%zz", id));
+	// Decoded once only.
+	EXPECT(!FindClickIdInReferrer("strybok_click%253D" + kClick, id));
+	// No fallback when a part already has the key.
+	EXPECT(!FindClickIdInReferrer("strybok_click=bad&x=strybok_click%3D" + kClick, id));
+	// The decoded value must match as well.
+	EXPECT(!FindClickIdInReferrer("strybok_click%3Dnope", id));
+}
+
+TEST(DeferredParsing, FindsTheClickIdInAPastedLink)
+{
+	std::string id;
+	EXPECT(FindClickIdInPastedLink(kPasted, Hosts(), id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(FindClickIdInPastedLink("  \n" + kPasted + "\t ", Hosts(), id));
+	EXPECT(FindClickIdInPastedLink("HTTPS://MY-APP.strybok.link/invite777?utm_source=a&strybok_click=" + kClick + "#top", Hosts(), id));
+	EXPECT_EQ(id, kClick);
+	// Standard query decoding of the key.
+	EXPECT(FindClickIdInPastedLink("https://my-app.strybok.link/invite777?strybok%5Fclick=" + kClick, Hosts(), id));
+	// The first occurrence decides.
+	EXPECT(FindClickIdInPastedLink(kPasted + "&strybok_click=" + kOtherClick, Hosts(), id));
+	EXPECT_EQ(id, kClick);
+	EXPECT(!FindClickIdInPastedLink("https://my-app.strybok.link/invite777?strybok_click=bad&strybok_click=" + kClick, Hosts(), id));
+
+	EXPECT(!FindClickIdInPastedLink("", Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("hello world", Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://my-app.strybok.link/invite777", Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://my-app.strybok.link/invite777#strybok_click=" + kClick, Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://evil.example/invite777?strybok_click=" + kClick, Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("http://my-app.strybok.link/invite777?strybok_click=" + kClick, Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://my-app.strybok.link/a/b?strybok_click=" + kClick, Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://user@my-app.strybok.link/invite777?strybok_click=" + kClick, Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("https://my-app.strybok.link/invite777?strybok_click=dc_tooshort", Hosts(), id));
+	EXPECT(!FindClickIdInPastedLink("text before " + kPasted, Hosts(), id));
+	EXPECT_EQ(id, "");
+}
+
+TEST(DeferredParsing, RequestBodiesAndEndpointsAreExact)
+{
+	EXPECT_EQ(BuildDeferredRedeemEndpoint("https://api.strybok.com/"), kRedeemUrl);
+	EXPECT_EQ(BuildDeferredMatchEndpoint("https://api.example/base//"), "https://api.example/base/v1/public/deferred-links/match");
+	EXPECT_EQ(BuildAndroidRedeemBody(kClick, kPackage, "0.3.0"),
+		"{\"platform\":\"android\",\"clickId\":\"" + kClick + "\",\"packageName\":\"com.example.game\",\"sdkVersion\":\"0.3.0\"}");
+	EXPECT_EQ(BuildIosRedeemBody(kClick, kBundle, ""),
+		"{\"platform\":\"ios\",\"clickId\":\"" + kClick + "\",\"bundleId\":\"com.example.Game\",\"sdkVersion\":\"" +
+			std::string(kSdkVersion) + "\"}");
+	EXPECT_EQ(BuildMatchBody(kBundle, "ipad", "uk-UA", "0.3.0+unreal"),
+		"{\"platform\":\"ios\",\"bundleId\":\"com.example.Game\",\"deviceFamily\":\"ipad\",\"locale\":\"uk-UA\",\"sdkVersion\":\"0.3.0+unreal\"}");
+}
+
+TEST(DeferredParsing, DeviceFamilyAndLocaleAreWhatTheServerAccepts)
+{
+	EXPECT(IsMatchDeviceFamily("iphone"));
+	EXPECT(IsMatchDeviceFamily("ipad"));
+	EXPECT(IsMatchDeviceFamily("ipod"));
+	EXPECT(!IsMatchDeviceFamily(""));
+	EXPECT(!IsMatchDeviceFamily("iPhone"));
+	EXPECT(!IsMatchDeviceFamily("mac"));
+
+	for (const char* good : {"en", "eng", "en-GB", "en_GB", "zh-Hans-CN", "sr-Latn-RS-x-a1", "de-1996"})
+	{
+		EXPECT_MSG(IsMatchLocale(good), good);
+	}
+	for (const char* bad : {"", "e", "engl", "en-", "en--GB", "en GB", "en-GB ", "1n", "en-abcdefghi", "en-a-b-c-d-e", "en.GB", "-en"})
+	{
+		EXPECT_MSG(!IsMatchLocale(bad), bad);
+	}
+}
+
+TEST(DeferredParsing, AnswerMustBeAResolvedDeferredLinkOfThisApp)
+{
+	ResolvedLink link;
+	EXPECT(ParseDeferredBody(DeferredBody(), Hosts(), false, link));
+	EXPECT_EQ(link.uri, "https://my-app.strybok.link/invite777");
+	EXPECT_EQ(link.linkId, "link_d");
+	EXPECT_EQ(link.routePath, "/invite/abc123");
+	EXPECT_EQ(link.payloadJson, "{\"invitationId\":\"abc123\"}");
+	EXPECT_EQ(link.campaign.source, "instagram");
+	EXPECT(link.isDeferred);
+	EXPECT(!link.isProbabilisticMatch);
+
+	// Unknown fields are ignored; `matched` is only required for a match.
+	EXPECT(ParseDeferredBody(MatchedBody(), Hosts(), false, link));
+	EXPECT(ParseDeferredBody(MatchedBody(), Hosts(), true, link));
+	EXPECT(link.isDeferred);
+	EXPECT(link.isProbabilisticMatch);
+	EXPECT(!ParseDeferredBody(DeferredBody(), Hosts(), true, link));
+	EXPECT(!ParseDeferredBody(DeferredBody("https://my-app.strybok.link/invite777", ",\"matched\":\"exact\""), Hosts(), true, link));
+
+	EXPECT(!ParseDeferredBody("not json", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("[]", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody(OkBody(), Hosts(), false, link)); // a plain resolve answer
+	EXPECT(!ParseDeferredBody(DeferredBody("https://evil.example/invite777"), Hosts(), false, link));
+	EXPECT(!ParseDeferredBody(DeferredBody("https://my-app.strybok.link/a/b"), Hosts(), false, link));
+	EXPECT(!ParseDeferredBody(DeferredBody("/invite777"), Hosts(), false, link));
+	const std::string url = "\"url\":\"https://my-app.strybok.link/invite777\"";
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"/x\"," + url + "}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"/x\"," + url + ",\"deferred\":false}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"/x\"," + url + ",\"deferred\":\"true\"}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"/x\",\"url\":7,\"deferred\":true}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"//x\"," + url + ",\"deferred\":true}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":\"l\",\"routePath\":\"/x\"," + url + ",\"deferred\":true}", Hosts(), false, link));
+	EXPECT(!ParseDeferredBody("{\"linkId\":7,\"appId\":\"a\",\"routePath\":\"/x\"," + url + ",\"deferred\":true}", Hosts(), false, link));
+}
+
+// --- Android ---
+
+TEST(DeferredAndroid, IsOffByDefaultAndThenDoesNothingAtAll)
+{
+	Deferred d;
+	d.config.deferredLinks = false;
+	int asked = 0;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	d.Listen();
+	EXPECT(Config().deferredLinks == false);
+	EXPECT(Config().allowProbabilisticMatching == false);
+	EXPECT(d.Start());
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Disabled);
+	EXPECT_EQ(asked, 0);
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+	EXPECT_EQ(d.store->reads, 0);
+	EXPECT_EQ(d.store->writes.size(), Count(0));
+	EXPECT_EQ(d.statuses.size(), Count(0));
+	d.Paste(kPasted);
+	EXPECT_EQ(d.pasted.size(), Count(1));
+	EXPECT_EQ(d.pasted[0], PastedLinkResult::Disabled);
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+	// Normal links carry the two flags, false.
+	d.sdk->HandleUrl(kInvite);
+	d.loop.Settle();
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(!d.received[0].isDeferred);
+	EXPECT(!d.received[0].isProbabilisticMatch);
+}
+
+TEST(DeferredAndroid, StaysDisabledWithoutAStoreAnIdentifierOrAKnownPlatform)
+{
+	int asked = 0;
+	const auto run = [&asked](Deferred& d) {
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+		d.config.allowProbabilisticMatching = true;
+		d.Listen();
+		EXPECT(d.Start());
+		d.sdk->EnableDeferredLinks();
+		d.loop.Advance(60000);
+		d.Paste(kPasted);
+		d.sdk->SkipPastedLink();
+		d.loop.Advance(60000);
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::Disabled);
+		EXPECT_EQ(d.statuses.size(), Count(0));
+		EXPECT_EQ(d.api.deferred.size(), Count(0));
+		EXPECT_EQ(d.store->writes.size(), Count(0));
+		EXPECT_EQ(d.pasted.size(), Count(1));
+		EXPECT_EQ(d.pasted[0], PastedLinkResult::Disabled);
+		EXPECT_EQ(d.received.size(), Count(0));
+	};
+
+	Deferred noStore;
+	noStore.config.deferredLinkStore = nullptr;
+	run(noStore);
+
+	Deferred noPackage;
+	noPackage.config.androidPackageName = "  ";
+	run(noPackage);
+
+	Deferred noBundle("ios");
+	noBundle.config.iosBundleId = "";
+	run(noBundle);
+
+	Deferred unknown("unknown");
+	run(unknown);
+
+	EXPECT_EQ(asked, 0);
+}
+
+TEST(DeferredAndroid, StartCompletesWhileASourceBlocksAndAttemptsAreStoredFirst)
+{
+	Deferred d;
+	std::string attemptsWhenAsked = "<not asked>";
+	bool doneWhenAsked = true;
+	const std::shared_ptr<MemoryStore> store = d.store;
+	d.config.installReferrerSources = {[&attemptsWhenAsked, &doneWhenAsked, store](std::function<void(const InstallReferrerAnswer&)>) {
+		attemptsWhenAsked = store->Attempts();
+		doneWhenAsked = store->Done();
+		// never answers
+	}};
+	d.Make();
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+
+	bool ready = false;
+	d.sdk->Start(&kInvite, [&ready]() { ready = true; });
+	// Nothing of the check happens inside Start.
+	EXPECT_EQ(attemptsWhenAsked, "<not asked>");
+	EXPECT_EQ(d.store->reads, 0);
+	d.loop.Settle();
+	EXPECT(ready);
+	EXPECT_EQ(attemptsWhenAsked, "1");
+	EXPECT(!doneWhenAsked);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Checking);
+
+	// The launch link, GetInitialLink and Resolve do not wait for the source.
+	ResolvedLink initial;
+	EXPECT(d.sdk->TakeInitialLink(initial));
+	EXPECT_EQ(initial.uri, kInvite);
+	EXPECT(!initial.isDeferred);
+	bool resolved = false;
+	d.sdk->Resolve(kInvite, [&resolved](const ResolvedLink* link, const LinkError*) { resolved = link != nullptr; });
+	d.loop.Settle();
+	EXPECT(resolved);
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+}
+
+TEST(DeferredAndroid, RedeemsTheClickIdAndDeliversTheLinkOnce)
+{
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("utm_source=google-play&strybok_click=" + kClick + "&utm_medium=organic"))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	bool doneWhenDelivered = false;
+	DeferredLinkStatus statusWhenDelivered = DeferredLinkStatus::Disabled;
+	d.sdk->SetLinkHandler([&d, &doneWhenDelivered, &statusWhenDelivered](const ResolvedLink& link) {
+		doneWhenDelivered = d.store->Done();
+		statusWhenDelivered = d.Status();
+		d.received.push_back(link);
+	});
+	d.sdk->SetListening(true);
+	EXPECT(d.Start());
+
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	const HttpRequest& request = d.api.deferred[0];
+	EXPECT_EQ(request.method, "POST");
+	EXPECT_EQ(request.url, kRedeemUrl);
+	EXPECT_EQ(request.headers.size(), Count(2));
+	EXPECT_EQ(HeaderOf(request, "Content-Type"), "application/json");
+	EXPECT_EQ(HeaderOf(request, "Accept"), "application/json");
+	EXPECT_EQ(request.body,
+		"{\"platform\":\"android\",\"clickId\":\"" + kClick + "\",\"packageName\":\"com.example.game\",\"sdkVersion\":\"" +
+			std::string(kSdkVersion) + "\"}");
+	// Nothing else of the referrer leaves the device.
+	EXPECT(request.body.find("utm_") == std::string::npos);
+	EXPECT(request.body.find("google-play") == std::string::npos);
+
+	EXPECT_EQ(d.received.size(), Count(1));
+	const ResolvedLink& link = d.received[0];
+	EXPECT_EQ(link.uri, "https://my-app.strybok.link/invite777");
+	EXPECT_EQ(link.linkId, "link_d");
+	EXPECT_EQ(link.appId, "app_1");
+	EXPECT_EQ(link.routePath, "/invite/abc123");
+	EXPECT_EQ(link.payloadJson, "{\"invitationId\":\"abc123\"}");
+	EXPECT_EQ(link.campaign.source, "instagram");
+	EXPECT(link.isDeferred);
+	EXPECT(!link.isProbabilisticMatch);
+
+	// `done` before delivery; the status says `Delivered`.
+	EXPECT(doneWhenDelivered);
+	EXPECT_EQ(statusWhenDelivered, DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.statuses.size(), Count(2));
+	EXPECT_EQ(d.statuses[0], DeferredLinkStatus::Checking);
+	EXPECT_EQ(d.statuses[1], DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.store->writes.size(), Count(2));
+	EXPECT_EQ(d.store->writes[0], "strybok.deferred.attempts=1");
+	EXPECT_EQ(d.store->writes[1], "strybok.deferred.done=1");
+
+	// No app_open for a deferred link, nothing for onError, and nothing happens later.
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.events.size(), Count(0));
+	EXPECT_EQ(d.errors.size(), Count(0));
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT_EQ(d.api.resolves.size(), Count(0));
+	// Only the two keys are ever stored.
+	EXPECT_EQ(d.store->values.size(), Count(2));
+}
+
+TEST(DeferredAndroid, IsQueuedUntilAListenerAttachesAndIsNeverTheInitialLink)
+{
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	EXPECT(d.Start());
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.sdk->PendingCount(), Count(1));
+
+	ResolvedLink initial;
+	EXPECT(!d.sdk->TakeInitialLink(initial));
+	bool called = false;
+	bool hasLink = true;
+	d.sdk->GetInitialLink([&called, &hasLink](const ResolvedLink* link) {
+		called = true;
+		hasLink = link != nullptr;
+	});
+	EXPECT(called);
+	EXPECT(!hasLink);
+	EXPECT_EQ(d.sdk->PendingCount(), Count(1)); // not removed from the queue either
+
+	d.Listen();
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(d.received[0].isDeferred);
+	EXPECT_EQ(d.sdk->PendingCount(), Count(0));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.events.size(), Count(0));
+}
+
+TEST(DeferredAndroid, StatusFollowsWhatTheSourcesAnswer)
+{
+	struct Case
+	{
+		std::vector<InstallReferrerAnswer> answers;
+		DeferredLinkStatus status;
+		bool done;
+	};
+	const std::vector<Case> cases = {
+		{{}, DeferredLinkStatus::Unavailable, true},
+		{{Never()}, DeferredLinkStatus::Unavailable, true},
+		{{Never(), Never()}, DeferredLinkStatus::Unavailable, true},
+		{{Referrer("")}, DeferredLinkStatus::NoReferrer, true},
+		{{Referrer("utm_source=google-play&utm_medium=organic")}, DeferredLinkStatus::NoReferrer, true},
+		{{Never(), Referrer("strybok_click=broken")}, DeferredLinkStatus::NoReferrer, true},
+		{{ForNow()}, DeferredLinkStatus::Pending, false},
+		{{Referrer("x=y"), ForNow(), Never()}, DeferredLinkStatus::Pending, false},
+		{{ForNow(), Referrer("x=y")}, DeferredLinkStatus::Pending, false},
+	};
+	for (const Case& testCase : cases)
+	{
+		Deferred d;
+		int asked = 0;
+		for (const InstallReferrerAnswer& answer : testCase.answers)
+		{
+			d.config.installReferrerSources.push_back(Answering(answer, &asked));
+		}
+		d.Listen();
+		EXPECT(d.Start());
+		EXPECT_EQ(d.Status(), testCase.status);
+		EXPECT_EQ(d.store->Done(), testCase.done);
+		EXPECT_EQ(d.store->Attempts(), "1");
+		EXPECT_EQ(asked, static_cast<int>(testCase.answers.size()));
+		EXPECT_EQ(d.api.deferred.size(), Count(0));
+		EXPECT_EQ(d.received.size(), Count(0));
+		EXPECT_EQ(d.errors.size(), Count(0));
+	}
+}
+
+TEST(DeferredAndroid, AsksTheSourcesInOrderAndStopsAtTheFirstClickId)
+{
+	Deferred d;
+	std::vector<int> order;
+	const auto source = [&order](int number, const InstallReferrerAnswer& answer) -> InstallReferrerSource {
+		return [&order, number, answer](std::function<void(const InstallReferrerAnswer&)> done) {
+			order.push_back(number);
+			done(answer);
+		};
+	};
+	HeldSource second;
+	d.config.installReferrerSources = {
+		source(1, ForNow()),
+		InstallReferrerSource(), // an empty function: skipped as "unavailable"
+		second.Source(),
+		source(3, Referrer("strybok_click=" + kClick)),
+		source(4, Referrer("strybok_click=" + kOtherClick)),
+	};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Listen();
+	EXPECT(d.Start());
+	// One after another: the third source is not asked while the second has not answered.
+	EXPECT_EQ(order.size(), Count(1));
+	EXPECT_EQ(second.Asked(), Count(1));
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Checking);
+	second.Answer(Referrer("utm_source=galaxy"));
+	d.loop.Settle();
+	EXPECT_EQ(order.size(), Count(2));
+	EXPECT_EQ(order[1], 3);
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT(d.api.deferred[0].body.find(kClick) != std::string::npos);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.received.size(), Count(1));
+	// A second answer to an old question changes nothing.
+	second.Answer(Referrer("strybok_click=" + kOtherClick));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT_EQ(d.received.size(), Count(1));
+}
+
+TEST(DeferredAndroid, AStillEncodedReferrerIsRedeemed)
+{
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click%3D" + kClick + "%26utm_source%3Dx"))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Listen();
+	EXPECT(d.Start());
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT(d.api.deferred[0].body.find("\"clickId\":\"" + kClick + "\"") != std::string::npos);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+}
+
+TEST(DeferredAndroid, ASourceThatTakesLongerThanTenSecondsIsUnavailableForNow)
+{
+	Deferred d;
+	HeldSource slow;
+	int askedNext = 0;
+	d.config.installReferrerSources = {slow.Source(), Answering(Never(), &askedNext)};
+	d.Listen();
+	EXPECT(d.Start());
+	d.loop.Advance(9900);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Checking);
+	EXPECT_EQ(askedNext, 0);
+	d.loop.Advance(200);
+	EXPECT_EQ(askedNext, 1);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+	EXPECT(!d.store->Done());
+	// The abandoned call answering late is ignored.
+	slow.Answer(Referrer("strybok_click=" + kClick));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+	EXPECT_EQ(d.loop.TaskCount(), Count(0));
+}
+
+TEST(DeferredAndroid, GivesUpAfterThreeAttemptsAcrossLaunches)
+{
+	const std::shared_ptr<MemoryStore> store = std::make_shared<MemoryStore>();
+	int asked = 0;
+	for (int launch = 1; launch <= 3; ++launch)
+	{
+		Deferred d("android", store);
+		d.config.installReferrerSources = {Answering(ForNow(), &asked)};
+		EXPECT(d.Start());
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+		EXPECT_EQ(store->Attempts(), std::to_string(launch));
+		EXPECT(!store->Done());
+	}
+	EXPECT_EQ(asked, 3);
+
+	Deferred fourth("android", store);
+	fourth.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	EXPECT(fourth.Start());
+	EXPECT_EQ(fourth.Status(), DeferredLinkStatus::Failed);
+	EXPECT(store->Done());
+	EXPECT_EQ(store->Attempts(), "3");
+	EXPECT_EQ(asked, 3);
+	EXPECT_EQ(fourth.api.deferred.size(), Count(0));
+
+	Deferred fifth("android", store);
+	fifth.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	EXPECT(fifth.Start());
+	EXPECT_EQ(fifth.Status(), DeferredLinkStatus::NotFirstLaunch);
+	EXPECT_EQ(asked, 3);
+
+	// A stored value that is not a number we wrote counts as used up.
+	const std::shared_ptr<MemoryStore> odd = std::make_shared<MemoryStore>();
+	odd->values[kDeferredAttemptsKey] = "many";
+	Deferred sixth("android", odd);
+	sixth.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	EXPECT(sixth.Start());
+	EXPECT_EQ(sixth.Status(), DeferredLinkStatus::Failed);
+	EXPECT_EQ(asked, 3);
+}
+
+TEST(DeferredAndroid, ServerAnswersDecideTheStatus)
+{
+	struct Case
+	{
+		Reply reply;
+		DeferredLinkStatus status;
+		bool done;
+		std::size_t requests;
+	};
+	const std::vector<Case> cases = {
+		{Respond(404, "{\"error\":{\"code\":\"DEFERRED_LINK_NOT_FOUND\"}}"), DeferredLinkStatus::NotFound, true, 1},
+		{Respond(400), DeferredLinkStatus::NotFound, true, 1},
+		{Respond(422), DeferredLinkStatus::NotFound, true, 1},
+		{Respond(410), DeferredLinkStatus::NotFound, true, 1},
+		{Respond(429), DeferredLinkStatus::Pending, false, 1}, // not retried in this launch
+		{Respond(500), DeferredLinkStatus::Pending, false, 3},
+		{Respond(503), DeferredLinkStatus::Pending, false, 3},
+		{NetworkError(), DeferredLinkStatus::Pending, false, 3},
+		{Hang(), DeferredLinkStatus::Pending, false, 3},
+		{Respond(204), DeferredLinkStatus::Failed, true, 1},
+		{Respond(200, "not json"), DeferredLinkStatus::Failed, true, 1},
+		{Respond(200, OkBody()), DeferredLinkStatus::Failed, true, 1},
+		{Respond(200, DeferredBody("https://evil.example/invite777")), DeferredLinkStatus::Failed, true, 1},
+		{Respond(200, "{\"linkId\":\"l\",\"appId\":\"a\",\"routePath\":\"//x\",\"url\":\"https://my-app.strybok.link/s\",\"deferred\":true}"),
+			DeferredLinkStatus::Failed, true, 1},
+	};
+	for (const Case& testCase : cases)
+	{
+		Deferred d;
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+		const Reply reply = testCase.reply;
+		d.api.onDeferred = [reply](const HttpRequest&) { return reply; };
+		d.Listen();
+		EXPECT(d.Start());
+		d.loop.Advance(5000);
+		EXPECT_EQ(d.Status(), testCase.status);
+		EXPECT_EQ(d.store->Done(), testCase.done);
+		EXPECT_EQ(d.api.deferred.size(), testCase.requests);
+		for (const HttpRequest& request : d.api.deferred)
+		{
+			EXPECT_EQ(request.body, d.api.deferred[0].body); // a retry sends the identical body
+			EXPECT_EQ(request.url, kRedeemUrl);
+		}
+		EXPECT_EQ(d.received.size(), Count(0));
+		EXPECT_EQ(d.errors.size(), Count(0));
+		EXPECT_EQ(d.api.events.size(), Count(0));
+		EXPECT_EQ(d.sdk->PendingCount(), Count(0));
+		EXPECT_EQ(d.loop.TaskCount(), Count(0));
+	}
+}
+
+TEST(DeferredAndroid, RetriesLikeResolvingAndThenDelivers)
+{
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.config.retryDelayMs = 100;
+	int calls = 0;
+	d.api.onDeferred = [&calls](const HttpRequest&) {
+		++calls;
+		if (calls == 1)
+		{
+			return Respond(502);
+		}
+		if (calls == 2)
+		{
+			return NetworkError();
+		}
+		return Respond(200, DeferredBody());
+	};
+	d.Listen();
+	bool ready = false;
+	d.sdk->Start(nullptr, [&ready]() { ready = true; });
+	d.loop.Advance(50);
+	EXPECT_EQ(calls, 1);
+	d.loop.Advance(100); // first pause: retryDelay
+	EXPECT_EQ(calls, 2);
+	d.loop.Advance(100);
+	EXPECT_EQ(calls, 2);
+	d.loop.Advance(100); // second pause: doubled
+	EXPECT_EQ(calls, 3);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT_EQ(d.api.deferred[0].body, d.api.deferred[2].body);
+}
+
+TEST(DeferredAndroid, ANormalLinkWinsBeforeTheRequest)
+{
+	Deferred d;
+	int asked = 0;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Listen();
+	EXPECT(d.Start(kInvite));
+	EXPECT_EQ(asked, 1);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Superseded);
+	EXPECT(d.store->Done());
+	EXPECT_EQ(d.api.deferred.size(), Count(0)); // the id is not even sent
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(!d.received[0].isDeferred);
+
+	// Also when the normal link could not be resolved: it was accepted.
+	Deferred failing;
+	failing.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	failing.api.onResolve = [](const HttpRequest&) { return Respond(404); };
+	EXPECT(failing.Start(kInvite));
+	EXPECT_EQ(failing.Status(), DeferredLinkStatus::Superseded);
+	EXPECT_EQ(failing.api.deferred.size(), Count(0));
+	EXPECT_EQ(failing.errors.size(), Count(1)); // the normal link's own error, nothing of the check
+
+	// A URL that is not ours, and a manual Resolve, do not count.
+	Deferred foreign;
+	foreign.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	foreign.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	foreign.Make();
+	foreign.Listen();
+	bool resolved = false;
+	foreign.sdk->Resolve(kInvite, [&resolved](const ResolvedLink* link, const LinkError*) { resolved = link != nullptr; });
+	EXPECT(foreign.Start("https://example.com/invite777"));
+	EXPECT(resolved);
+	EXPECT_EQ(foreign.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(foreign.received.size(), Count(1));
+	EXPECT(foreign.received[0].isDeferred);
+}
+
+TEST(DeferredAndroid, ANormalLinkWinsWhileTheRequestIsInFlight)
+{
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.config.timeoutMs = 5000;
+	d.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Checking);
+
+	d.sdk->HandleUrl(kInvite);
+	d.loop.Settle();
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(!d.received[0].isDeferred);
+
+	EXPECT(d.api.Complete(d.api.deferredIds[0], Respond(200, DeferredBody())));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Superseded);
+	EXPECT(d.store->Done());
+	EXPECT_EQ(d.received.size(), Count(1)); // one launch, one navigation
+	EXPECT_EQ(d.sdk->PendingCount(), Count(0));
+}
+
+TEST(DeferredAndroid, StopDuringTheCheckDeliversNothing)
+{
+	// While a source is being asked.
+	Deferred asking;
+	HeldSource held;
+	asking.config.installReferrerSources = {held.Source()};
+	asking.Make();
+	asking.Listen();
+	EXPECT(asking.Start());
+	asking.sdk->Stop();
+	held.Answer(Referrer("strybok_click=" + kClick));
+	asking.loop.Advance(60000);
+	EXPECT_EQ(asking.api.deferred.size(), Count(0));
+	EXPECT_EQ(asking.loop.TaskCount(), Count(0));
+	EXPECT(!asking.store->Done());
+
+	// While the request is in flight.
+	Deferred d;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	d.sdk->Stop();
+	EXPECT_EQ(d.api.cancelled.size(), Count(1));
+	EXPECT_EQ(d.loop.TaskCount(), Count(0));
+	EXPECT(d.api.Complete(d.api.deferredIds[0], Respond(200, DeferredBody())));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.received.size(), Count(0));
+	EXPECT_EQ(d.statuses.back(), DeferredLinkStatus::Checking);
+	EXPECT(!d.store->Done());
+	EXPECT_EQ(d.store->Attempts(), "1"); // the attempt is used up
+	d.sdk->EnableDeferredLinks(); // harmless
+	d.Paste(kPasted);
+	EXPECT_EQ(d.pasted.back(), PastedLinkResult::Disabled);
+
+	// Stopped before the check's turn came.
+	Deferred early;
+	int asked = 0;
+	early.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	early.Make();
+	early.sdk->Start(nullptr);
+	early.sdk->Stop();
+	early.loop.Advance(60000);
+	EXPECT_EQ(asked, 0);
+	EXPECT_EQ(early.store->writes.size(), Count(0));
+}
+
+TEST(DeferredAndroid, CanBeSwitchedOnLaterAndRunsOnce)
+{
+	Deferred d;
+	d.config.deferredLinks = false;
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Disabled);
+	EXPECT_EQ(d.store->reads, 0);
+
+	// Sources handed over before switching on (for example after a consent screen).
+	int asked = 0;
+	d.sdk->SetInstallReferrerSources({Answering(Referrer("strybok_click=" + kClick), &asked)});
+	d.sdk->EnableDeferredLinks();
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+	EXPECT_EQ(asked, 0); // not inside the call
+	d.sdk->EnableDeferredLinks();
+	d.loop.Settle();
+	EXPECT_EQ(asked, 1);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.received.size(), Count(1));
+	d.sdk->EnableDeferredLinks();
+	d.sdk->SetInstallReferrerSources({Answering(Referrer("strybok_click=" + kOtherClick), &asked)});
+	d.loop.Advance(60000);
+	EXPECT_EQ(asked, 1);
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT_EQ(d.statuses.size(), Count(3));
+	EXPECT_EQ(d.statuses[0], DeferredLinkStatus::Pending);
+
+	// Switched on before Start: runs after Start, as usual.
+	Deferred before;
+	before.config.deferredLinks = false;
+	before.config.installReferrerSources = {Answering(Referrer("x=y"), &asked)};
+	before.Make();
+	before.sdk->EnableDeferredLinks();
+	before.loop.Advance(60000);
+	EXPECT_EQ(asked, 1);
+	EXPECT_EQ(before.Status(), DeferredLinkStatus::Pending);
+	EXPECT(before.Start());
+	EXPECT_EQ(asked, 2);
+	EXPECT_EQ(before.Status(), DeferredLinkStatus::NoReferrer);
+}
+
+TEST(DeferredAndroid, ARestartAfterEachStepNeverDeliversTwice)
+{
+	const std::shared_ptr<MemoryStore> store = std::make_shared<MemoryStore>();
+
+	// 1. Killed while the source was being asked: one attempt is gone, nothing else.
+	{
+		Deferred d("android", store);
+		HeldSource held;
+		d.config.installReferrerSources = {held.Source()};
+		EXPECT(d.Start());
+		EXPECT_EQ(store->Attempts(), "1");
+	}
+	// 2. Killed while the request was in flight (the server may have used the id up).
+	{
+		Deferred d("android", store);
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+		d.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+		d.config.timeoutMs = 5000;
+		EXPECT(d.Start());
+		EXPECT_EQ(d.api.deferred.size(), Count(1));
+		EXPECT_EQ(store->Attempts(), "2");
+		EXPECT(!store->Done());
+	}
+	// 3. The next launch sends the same id again and delivers.
+	{
+		Deferred d("android", store);
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+		d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+		d.Make();
+		d.Listen();
+		EXPECT(d.Start());
+		EXPECT_EQ(store->Attempts(), "3");
+		EXPECT(d.api.deferred[0].body.find(kClick) != std::string::npos);
+		EXPECT_EQ(d.received.size(), Count(1));
+		EXPECT(store->Done());
+	}
+	// 4. Every later launch does nothing: no source, no request, no delivery.
+	for (int launch = 0; launch < 2; ++launch)
+	{
+		Deferred d("android", store);
+		int asked = 0;
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+		d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+		d.Make();
+		d.Listen();
+		EXPECT(d.Start());
+		d.loop.Advance(60000);
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::NotFirstLaunch);
+		EXPECT_EQ(asked, 0);
+		EXPECT_EQ(d.api.deferred.size(), Count(0));
+		EXPECT_EQ(d.received.size(), Count(0));
+	}
+	// Nothing but the two values was ever stored.
+	EXPECT_EQ(store->values.size(), Count(2));
+	for (const std::string& write : store->writes)
+	{
+		EXPECT(write.find("dc_") == std::string::npos);
+	}
+}
+
+TEST(DeferredAndroid, StoreFailuresNeverRiskASecondDelivery)
+{
+	int asked = 0;
+	// Reading fails: nothing is asked or sent.
+	Deferred unreadable;
+	unreadable.store->failReads = true;
+	unreadable.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	EXPECT(unreadable.Start());
+	EXPECT_EQ(unreadable.Status(), DeferredLinkStatus::Pending);
+	EXPECT_EQ(asked, 0);
+	EXPECT_EQ(unreadable.api.deferred.size(), Count(0));
+
+	// The attempt cannot be counted: the source is not asked.
+	Deferred uncounted;
+	uncounted.store->failWritesTo = kDeferredAttemptsKey;
+	uncounted.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	EXPECT(uncounted.Start());
+	EXPECT_EQ(uncounted.Status(), DeferredLinkStatus::Pending);
+	EXPECT_EQ(asked, 0);
+	EXPECT_EQ(uncounted.api.deferred.size(), Count(0));
+
+	// `done` cannot be stored before delivery: the link is not delivered.
+	Deferred unfinished;
+	unfinished.store->failWritesTo = kDeferredDoneKey;
+	unfinished.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	unfinished.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	unfinished.Make();
+	unfinished.Listen();
+	EXPECT(unfinished.Start());
+	EXPECT_EQ(asked, 1);
+	EXPECT_EQ(unfinished.api.deferred.size(), Count(1));
+	EXPECT_EQ(unfinished.Status(), DeferredLinkStatus::Failed);
+	EXPECT_EQ(unfinished.received.size(), Count(0));
+	EXPECT_EQ(unfinished.sdk->PendingCount(), Count(0));
+
+	// Elsewhere a failed `done` write is ignored: the status is what was found.
+	Deferred organic;
+	organic.store->failWritesTo = kDeferredDoneKey;
+	organic.config.installReferrerSources = {Answering(Referrer("utm_source=google-play"))};
+	EXPECT(organic.Start());
+	EXPECT_EQ(organic.Status(), DeferredLinkStatus::NoReferrer);
+}
+
+TEST(DeferredAndroid, WorksSynchronouslyAndSurvivesBeingDestroyedInAHandler)
+{
+	Deferred d;
+	d.api.synchronous = true;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	int delivered = 0;
+	d.sdk->SetLinkHandler([&d, &delivered](const ResolvedLink& link) {
+		delivered += link.isDeferred ? 1 : 0;
+		d.sdk.reset();
+	});
+	d.sdk->SetListening(true);
+	d.sdk->Start(nullptr);
+	d.loop.Advance(60000);
+	EXPECT_EQ(delivered, 1);
+	EXPECT(d.sdk == nullptr);
+	EXPECT_EQ(d.loop.TaskCount(), Count(0));
+
+	// Destroyed from the status handler: nothing follows.
+	Deferred s;
+	s.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	s.Make();
+	s.Listen();
+	s.sdk->SetDeferredLinkStatusHandler([&s](DeferredLinkStatus) { s.sdk.reset(); });
+	s.sdk->Start(nullptr);
+	s.loop.Advance(60000);
+	EXPECT(s.sdk == nullptr);
+	EXPECT_EQ(s.api.deferred.size(), Count(0));
+	EXPECT_EQ(s.store->writes.size(), Count(0));
+}
+
+// --- iOS: pasted link ---
+
+TEST(DeferredPaste, WithoutMatchingNothingIsAutomaticAndPastingStaysPossible)
+{
+	Deferred d("ios");
+	int asked = 0;
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick), &asked)};
+	d.Make();
+	d.Listen();
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+	EXPECT(d.Start());
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Unavailable);
+	EXPECT_EQ(asked, 0); // no install referrer on iOS
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+	EXPECT_EQ(d.store->writes.size(), Count(0)); // `done` is not stored
+	d.sdk->SkipPastedLink(); // nothing to skip
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+}
+
+TEST(DeferredPaste, RedeemsThePastedLinkAndDeliversIt)
+{
+	Deferred d("ios");
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	bool doneWhenDelivered = false;
+	d.sdk->SetLinkHandler([&d, &doneWhenDelivered](const ResolvedLink& link) {
+		doneWhenDelivered = d.store->Done();
+		d.received.push_back(link);
+	});
+	d.sdk->SetListening(true);
+	EXPECT(d.Start());
+
+	d.Paste("  " + kPasted + "&utm_source=secret#frag\n");
+	EXPECT_EQ(d.pasted.size(), Count(0));
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.size(), Count(1));
+	EXPECT_EQ(d.pasted[0], PastedLinkResult::Delivered);
+
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	const HttpRequest& request = d.api.deferred[0];
+	EXPECT_EQ(request.method, "POST");
+	EXPECT_EQ(request.url, kRedeemUrl);
+	EXPECT_EQ(HeaderOf(request, "Content-Type"), "application/json");
+	EXPECT_EQ(HeaderOf(request, "Accept"), "application/json");
+	// Only the click id, never the pasted URL.
+	EXPECT_EQ(request.body,
+		"{\"platform\":\"ios\",\"clickId\":\"" + kClick + "\",\"bundleId\":\"com.example.Game\",\"sdkVersion\":\"" +
+			std::string(kSdkVersion) + "\"}");
+
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT_EQ(d.received[0].uri, "https://my-app.strybok.link/invite777"); // the answer's url, without the click id
+	EXPECT(d.received[0].isDeferred);
+	EXPECT(!d.received[0].isProbabilisticMatch);
+	EXPECT(doneWhenDelivered);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.store->values.size(), Count(1)); // `done` only: flow A uses no attempts
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.events.size(), Count(0));
+	EXPECT_EQ(d.errors.size(), Count(0));
+
+	ResolvedLink initial;
+	EXPECT(!d.sdk->TakeInitialLink(initial));
+
+	// Once handled, always handled - in this launch and in the next.
+	d.Paste(kPasted);
+	EXPECT_EQ(d.pasted.back(), PastedLinkResult::AlreadyHandled);
+	Deferred next("ios", d.store);
+	EXPECT(next.Start());
+	EXPECT_EQ(next.Status(), DeferredLinkStatus::NotFirstLaunch);
+	next.Paste(kPasted);
+	EXPECT_EQ(next.pasted.back(), PastedLinkResult::AlreadyHandled);
+	EXPECT_EQ(next.api.deferred.size(), Count(0));
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+}
+
+TEST(DeferredPaste, WorksBeforeStartAndQueuesUntilAListenerAttaches)
+{
+	Deferred d("ios");
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	d.Paste(kPasted);
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.back(), PastedLinkResult::Delivered);
+	EXPECT_EQ(d.sdk->PendingCount(), Count(1));
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	// The check finds the work done and keeps the status.
+	EXPECT(d.Start());
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	d.Listen();
+	EXPECT_EQ(d.received.size(), Count(1));
+}
+
+TEST(DeferredPaste, AnythingElseIsNotOursAndIsSentNowhere)
+{
+	Deferred d("ios");
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	const std::vector<std::string> texts = {
+		"",
+		"   ",
+		"my password is hunter2",
+		"https://my-app.strybok.link/invite777",
+		"https://my-app.strybok.link/invite777?strybok_click=dc_wrong",
+		"https://other.example/invite777?strybok_click=" + kClick,
+		"http://my-app.strybok.link/invite777?strybok_click=" + kClick,
+		"https://my-app.strybok.link/invite777/more?strybok_click=" + kClick,
+		"strybok_click=" + kClick,
+	};
+	for (const std::string& text : texts)
+	{
+		d.Paste(text);
+		EXPECT_EQ(d.pasted.back(), PastedLinkResult::NotOurs);
+	}
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.pasted.size(), texts.size());
+	EXPECT_EQ(d.api.deferred.size(), Count(0));
+	EXPECT_EQ(d.store->writes.size(), Count(0));
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Unavailable);
+	EXPECT_EQ(d.errors.size(), Count(0));
+}
+
+TEST(DeferredPaste, IsDeliveredEvenAfterANormalLink)
+{
+	Deferred d("ios");
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start(kInvite));
+	EXPECT_EQ(d.received.size(), Count(1));
+	d.Paste(kPasted);
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.back(), PastedLinkResult::Delivered);
+	EXPECT_EQ(d.received.size(), Count(2));
+	EXPECT(d.received[1].isDeferred);
+	// The pasted link does not disturb duplicate detection of normal links, and is not subject to it.
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.events.size(), Count(1)); // the normal link's only
+}
+
+TEST(DeferredPaste, ServerAnswersDecideTheResult)
+{
+	struct Case
+	{
+		Reply reply;
+		PastedLinkResult result;
+		bool done;
+		std::size_t requests;
+		DeferredLinkStatus status;
+	};
+	const std::vector<Case> cases = {
+		{Respond(404), PastedLinkResult::NotFound, true, 1, DeferredLinkStatus::NotFound},
+		{Respond(422), PastedLinkResult::NotFound, true, 1, DeferredLinkStatus::NotFound},
+		{Respond(200, "{}"), PastedLinkResult::Failed, true, 1, DeferredLinkStatus::Failed},
+		{Respond(200, DeferredBody("https://evil.example/invite777")), PastedLinkResult::Failed, true, 1, DeferredLinkStatus::Failed},
+		{Respond(429), PastedLinkResult::Failed, false, 1, DeferredLinkStatus::Unavailable},
+		{Respond(500), PastedLinkResult::Failed, false, 3, DeferredLinkStatus::Unavailable},
+		{NetworkError(), PastedLinkResult::Failed, false, 3, DeferredLinkStatus::Unavailable},
+		{Hang(), PastedLinkResult::Failed, false, 3, DeferredLinkStatus::Unavailable},
+	};
+	for (const Case& testCase : cases)
+	{
+		Deferred d("ios");
+		const Reply reply = testCase.reply;
+		d.api.onDeferred = [reply](const HttpRequest&) { return reply; };
+		d.Make();
+		d.Listen();
+		EXPECT(d.Start());
+		d.Paste(kPasted);
+		d.loop.Advance(5000);
+		EXPECT_EQ(d.pasted.size(), Count(1));
+		EXPECT_EQ(d.pasted[0], testCase.result);
+		EXPECT_EQ(d.store->Done(), testCase.done);
+		EXPECT_EQ(d.api.deferred.size(), testCase.requests);
+		EXPECT_EQ(d.Status(), testCase.status);
+		EXPECT_EQ(d.received.size(), Count(0));
+		EXPECT_EQ(d.errors.size(), Count(0));
+		EXPECT_EQ(d.store->Attempts(), "<none>");
+
+		// After a temporary failure the person can paste again; after a definite answer not.
+		d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+		d.Paste(kPasted);
+		d.loop.Advance(5000);
+		EXPECT_EQ(d.pasted.back(), testCase.done ? PastedLinkResult::AlreadyHandled : PastedLinkResult::Delivered);
+		EXPECT_EQ(d.received.size(), testCase.done ? Count(0) : Count(1));
+	}
+}
+
+TEST(DeferredPaste, CallsAreHandledOneAfterAnother)
+{
+	Deferred d("ios");
+	d.config.timeoutMs = 5000;
+	d.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	d.Paste(kPasted);
+	d.Paste(kPasted);
+	d.Paste("not a link");
+	d.loop.Settle();
+	EXPECT_EQ(d.api.deferred.size(), Count(1)); // the second call waits for the first
+	EXPECT_EQ(d.pasted.size(), Count(0));
+	EXPECT(d.api.Complete(d.api.deferredIds[0], Respond(200, DeferredBody())));
+	EXPECT_EQ(d.pasted.size(), Count(3));
+	EXPECT_EQ(d.pasted[0], PastedLinkResult::Delivered);
+	EXPECT_EQ(d.pasted[1], PastedLinkResult::AlreadyHandled);
+	EXPECT_EQ(d.pasted[2], PastedLinkResult::AlreadyHandled);
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	EXPECT_EQ(d.received.size(), Count(1));
+}
+
+TEST(DeferredPaste, IsDisabledOffIosAndDropsItsCallbackWhenStopped)
+{
+	Deferred android;
+	android.config.installReferrerSources = {Answering(ForNow())};
+	EXPECT(android.Start());
+	android.Paste(kPasted);
+	EXPECT_EQ(android.pasted.back(), PastedLinkResult::Disabled);
+	EXPECT_EQ(android.api.deferred.size(), Count(0));
+
+	Deferred d("ios");
+	d.config.timeoutMs = 5000;
+	d.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	d.Paste(kPasted);
+	d.Paste(kPasted);
+	d.loop.Settle();
+	d.sdk->Stop();
+	EXPECT(d.api.Complete(d.api.deferredIds[0], Respond(200, DeferredBody())));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.pasted.size(), Count(0));
+	EXPECT_EQ(d.received.size(), Count(0));
+	EXPECT(!d.store->Done());
+	EXPECT_EQ(d.loop.TaskCount(), Count(0));
+
+	// A store that cannot be read: nothing is sent.
+	Deferred unreadable("ios");
+	unreadable.Make();
+	unreadable.store->failReads = true;
+	unreadable.Paste(kPasted);
+	EXPECT_EQ(unreadable.pasted.back(), PastedLinkResult::Failed);
+	EXPECT_EQ(unreadable.api.deferred.size(), Count(0));
+
+	// `done` cannot be stored: the link is not delivered.
+	Deferred unwritable("ios");
+	unwritable.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	unwritable.Make();
+	unwritable.Listen();
+	unwritable.store->failWritesTo = kDeferredDoneKey;
+	unwritable.Paste(kPasted);
+	unwritable.loop.Settle();
+	EXPECT_EQ(unwritable.pasted.back(), PastedLinkResult::Failed);
+	EXPECT_EQ(unwritable.Status(), DeferredLinkStatus::Failed);
+	EXPECT_EQ(unwritable.received.size(), Count(0));
+}
+
+// --- iOS: probabilistic matching ---
+
+namespace
+{
+
+Deferred& Matching(Deferred& d)
+{
+	d.config.allowProbabilisticMatching = true;
+	d.api.onDeferred = [](const HttpRequest& request) {
+		return request.url == kMatchUrl ? Respond(200, MatchedBody()) : Respond(200, DeferredBody());
+	};
+	return d;
+}
+
+} // namespace
+
+TEST(DeferredMatching, AsksTheServerOnceAndMarksTheLinkAsAGuess)
+{
+	Deferred d("ios");
+	Matching(d);
+	d.config.locale = []() { return std::string("uk-UA"); };
+	d.config.deviceFamily = []() { return std::string("ipad"); };
+	d.Make();
+	bool doneWhenDelivered = false;
+	d.sdk->SetLinkHandler([&d, &doneWhenDelivered](const ResolvedLink& link) {
+		doneWhenDelivered = d.store->Done();
+		d.received.push_back(link);
+	});
+	d.sdk->SetListening(true);
+	bool ready = false;
+	d.sdk->Start(nullptr, [&ready]() { ready = true; });
+	EXPECT(ready);
+	EXPECT_EQ(d.api.deferred.size(), Count(0)); // not on the start path
+	d.loop.Settle();
+
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	const HttpRequest& request = d.api.deferred[0];
+	EXPECT_EQ(request.method, "POST");
+	EXPECT_EQ(request.url, kMatchUrl);
+	EXPECT_EQ(HeaderOf(request, "Content-Type"), "application/json");
+	EXPECT_EQ(HeaderOf(request, "Accept"), "application/json");
+	EXPECT_EQ(request.body,
+		"{\"platform\":\"ios\",\"bundleId\":\"com.example.Game\",\"deviceFamily\":\"ipad\",\"locale\":\"uk-UA\",\"sdkVersion\":\"" +
+			std::string(kSdkVersion) + "\"}");
+
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(d.received[0].isDeferred);
+	EXPECT(d.received[0].isProbabilisticMatch);
+	EXPECT_EQ(d.received[0].uri, "https://my-app.strybok.link/invite777");
+	EXPECT(doneWhenDelivered);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(d.statuses.size(), Count(2));
+	EXPECT_EQ(d.statuses[0], DeferredLinkStatus::Checking);
+	EXPECT_EQ(d.store->writes[0], "strybok.deferred.attempts=1");
+	EXPECT_EQ(d.store->writes[1], "strybok.deferred.done=1");
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.api.events.size(), Count(0));
+	EXPECT_EQ(d.errors.size(), Count(0));
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+
+	Deferred next("ios", d.store);
+	Matching(next);
+	EXPECT(next.Start());
+	EXPECT_EQ(next.Status(), DeferredLinkStatus::NotFirstLaunch);
+	EXPECT_EQ(next.api.deferred.size(), Count(0));
+}
+
+TEST(DeferredMatching, ServerAnswersDecideTheStatus)
+{
+	struct Case
+	{
+		Reply reply;
+		DeferredLinkStatus status;
+		bool done;
+		std::size_t requests;
+	};
+	const std::vector<Case> cases = {
+		{Respond(404), DeferredLinkStatus::NotFound, true, 1}, // nothing fitted, or more than one did
+		{Respond(422), DeferredLinkStatus::NotFound, true, 1},
+		{Respond(200, DeferredBody()), DeferredLinkStatus::Failed, true, 1}, // `matched` is missing
+		{Respond(200, DeferredBody("https://my-app.strybok.link/invite777", ",\"matched\":true")), DeferredLinkStatus::Failed, true, 1},
+		{Respond(200, "<html>"), DeferredLinkStatus::Failed, true, 1},
+		{Respond(429), DeferredLinkStatus::Pending, false, 1},
+		{Respond(500), DeferredLinkStatus::Pending, false, 3},
+		{NetworkError(), DeferredLinkStatus::Pending, false, 3},
+		{Hang(), DeferredLinkStatus::Pending, false, 3},
+	};
+	for (const Case& testCase : cases)
+	{
+		Deferred d("ios");
+		d.config.allowProbabilisticMatching = true;
+		const Reply reply = testCase.reply;
+		d.api.onDeferred = [reply](const HttpRequest&) { return reply; };
+		d.Make();
+		d.Listen();
+		EXPECT(d.Start());
+		d.loop.Advance(5000);
+		EXPECT_EQ(d.Status(), testCase.status);
+		EXPECT_EQ(d.store->Done(), testCase.done);
+		EXPECT_EQ(d.store->Attempts(), "1");
+		EXPECT_EQ(d.api.deferred.size(), testCase.requests);
+		for (const HttpRequest& request : d.api.deferred)
+		{
+			EXPECT_EQ(request.url, kMatchUrl);
+			EXPECT_EQ(request.body, d.api.deferred[0].body);
+		}
+		EXPECT_EQ(d.received.size(), Count(0));
+		EXPECT_EQ(d.errors.size(), Count(0));
+	}
+}
+
+TEST(DeferredMatching, GivesUpAfterThreeAttemptsAcrossLaunches)
+{
+	const std::shared_ptr<MemoryStore> store = std::make_shared<MemoryStore>();
+	for (int launch = 1; launch <= 3; ++launch)
+	{
+		Deferred d("ios", store);
+		d.config.allowProbabilisticMatching = true;
+		d.api.onDeferred = [](const HttpRequest&) { return Respond(503); };
+		EXPECT(d.Start());
+		d.loop.Advance(5000);
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::Pending);
+		EXPECT_EQ(store->Attempts(), std::to_string(launch));
+	}
+	Deferred fourth("ios", store);
+	Matching(fourth);
+	EXPECT(fourth.Start());
+	EXPECT_EQ(fourth.Status(), DeferredLinkStatus::Failed);
+	EXPECT(store->Done());
+	EXPECT_EQ(fourth.api.deferred.size(), Count(0));
+}
+
+TEST(DeferredMatching, NeedsADeviceFamilyAndALocaleFromTheApp)
+{
+	const auto expectUnavailable = [](Deferred& d) {
+		d.Make();
+		d.Listen();
+		EXPECT(d.Start());
+		d.loop.Advance(60000);
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::Unavailable);
+		EXPECT(d.store->Done());
+		EXPECT_EQ(d.store->Attempts(), "1");
+		EXPECT_EQ(d.api.deferred.size(), Count(0));
+	};
+
+	Deferred noFamily("ios");
+	Matching(noFamily).config.deviceFamily = nullptr;
+	expectUnavailable(noFamily);
+
+	Deferred mac("ios");
+	Matching(mac).config.deviceFamily = []() { return std::string("mac"); };
+	expectUnavailable(mac);
+
+	Deferred noLocale("ios");
+	Matching(noLocale).config.locale = nullptr;
+	expectUnavailable(noLocale);
+
+	Deferred emptyLocale("ios");
+	Matching(emptyLocale).config.locale = []() { return std::string(); };
+	expectUnavailable(emptyLocale);
+
+	Deferred oddLocale("ios");
+	Matching(oddLocale).config.locale = []() { return std::string("English (United Kingdom)"); };
+	expectUnavailable(oddLocale);
+}
+
+TEST(DeferredMatching, ANormalLinkWins)
+{
+	// Before the request: nothing is sent.
+	Deferred before("ios");
+	Matching(before).Make();
+	before.Listen();
+	EXPECT(before.Start(kInvite));
+	EXPECT_EQ(before.Status(), DeferredLinkStatus::Superseded);
+	EXPECT(before.store->Done());
+	EXPECT_EQ(before.api.deferred.size(), Count(0));
+	EXPECT_EQ(before.received.size(), Count(1));
+
+	// While the request is in flight: the answer is dropped.
+	Deferred during("ios");
+	during.config.allowProbabilisticMatching = true;
+	during.config.timeoutMs = 5000;
+	during.api.onDeferred = [](const HttpRequest&) { return Hang(); };
+	during.Make();
+	during.Listen();
+	EXPECT(during.Start());
+	EXPECT_EQ(during.api.deferred.size(), Count(1));
+	during.sdk->HandleUrl(kInvite);
+	during.loop.Settle();
+	EXPECT(during.api.Complete(during.api.deferredIds[0], Respond(200, MatchedBody())));
+	EXPECT_EQ(during.Status(), DeferredLinkStatus::Superseded);
+	EXPECT_EQ(during.received.size(), Count(1));
+	EXPECT(!during.received[0].isDeferred);
+}
+
+TEST(DeferredMatching, WaitsForThePasteWhenThePasteboardMayHoldALink)
+{
+	const auto probe = [](bool answer, int* calls) {
+		return [answer, calls](std::function<void(bool)> done) {
+			++*calls;
+			done(answer);
+		};
+	};
+
+	// Not ours: matching starts.
+	int probed = 0;
+	Deferred notOurs("ios");
+	Matching(notOurs).config.pasteboardMayContainLink = probe(true, &probed);
+	notOurs.Make();
+	notOurs.Listen();
+	EXPECT(notOurs.Start());
+	notOurs.loop.Advance(60000);
+	EXPECT_EQ(probed, 1);
+	EXPECT_EQ(notOurs.Status(), DeferredLinkStatus::AwaitingPaste);
+	EXPECT_EQ(notOurs.api.deferred.size(), Count(0));
+	EXPECT_EQ(notOurs.store->writes.size(), Count(0));
+	notOurs.Paste("https://example.com/something");
+	EXPECT_EQ(notOurs.pasted.back(), PastedLinkResult::NotOurs);
+	notOurs.loop.Settle();
+	EXPECT_EQ(notOurs.api.deferred.size(), Count(1));
+	EXPECT_EQ(notOurs.api.deferred[0].url, kMatchUrl);
+	EXPECT_EQ(notOurs.Status(), DeferredLinkStatus::Delivered);
+	EXPECT(notOurs.received[0].isProbabilisticMatch);
+	// Matching ran once; another foreign paste does not start it again.
+	notOurs.Paste("still not a link");
+	notOurs.sdk->SkipPastedLink();
+	notOurs.loop.Advance(60000);
+	EXPECT_EQ(notOurs.api.deferred.size(), Count(1));
+	EXPECT_EQ(notOurs.pasted.back(), PastedLinkResult::AlreadyHandled);
+
+	// The person moved on without pasting.
+	Deferred skipped("ios");
+	Matching(skipped).config.pasteboardMayContainLink = probe(true, &probed);
+	skipped.Make();
+	skipped.Listen();
+	EXPECT(skipped.Start());
+	EXPECT_EQ(skipped.Status(), DeferredLinkStatus::AwaitingPaste);
+	skipped.sdk->SkipPastedLink();
+	skipped.sdk->SkipPastedLink();
+	skipped.loop.Settle();
+	EXPECT_EQ(skipped.api.deferred.size(), Count(1));
+	EXPECT_EQ(skipped.api.deferred[0].url, kMatchUrl);
+	EXPECT_EQ(skipped.Status(), DeferredLinkStatus::Delivered);
+	EXPECT_EQ(skipped.received.size(), Count(1));
+
+	// The pasted link is ours: delivered exactly, and matching never runs.
+	Deferred ours("ios");
+	Matching(ours).config.pasteboardMayContainLink = probe(true, &probed);
+	ours.Make();
+	ours.Listen();
+	EXPECT(ours.Start());
+	ours.Paste(kPasted);
+	ours.loop.Settle();
+	EXPECT_EQ(ours.pasted.back(), PastedLinkResult::Delivered);
+	ours.sdk->SkipPastedLink();
+	ours.loop.Advance(60000);
+	EXPECT_EQ(ours.api.deferred.size(), Count(1));
+	EXPECT_EQ(ours.api.deferred[0].url, kRedeemUrl);
+	EXPECT_EQ(ours.received.size(), Count(1));
+	EXPECT(!ours.received[0].isProbabilisticMatch);
+	EXPECT_EQ(ours.store->Attempts(), "<none>");
+
+	// A temporary failure of the paste keeps waiting; the person can paste again.
+	Deferred retry("ios");
+	Matching(retry).config.pasteboardMayContainLink = probe(true, &probed);
+	retry.api.onDeferred = [](const HttpRequest&) { return Respond(429); };
+	retry.Make();
+	retry.Listen();
+	EXPECT(retry.Start());
+	retry.Paste(kPasted);
+	retry.loop.Settle();
+	EXPECT_EQ(retry.pasted.back(), PastedLinkResult::Failed);
+	EXPECT_EQ(retry.Status(), DeferredLinkStatus::AwaitingPaste);
+	EXPECT_EQ(retry.api.deferred.size(), Count(1));
+
+	// Nothing to paste: matching starts at once.
+	Deferred empty("ios");
+	Matching(empty).config.pasteboardMayContainLink = probe(false, &probed);
+	empty.Make();
+	empty.Listen();
+	EXPECT(empty.Start());
+	EXPECT_EQ(empty.api.deferred.size(), Count(1));
+	EXPECT_EQ(empty.api.deferred[0].url, kMatchUrl);
+
+	// A probe that never answers counts as "no" after ten seconds.
+	Deferred silent("ios");
+	Matching(silent).config.pasteboardMayContainLink = [](std::function<void(bool)>) {};
+	silent.Make();
+	silent.Listen();
+	EXPECT(silent.Start());
+	silent.loop.Advance(9000);
+	EXPECT_EQ(silent.api.deferred.size(), Count(0));
+	EXPECT_EQ(silent.Status(), DeferredLinkStatus::Checking);
+	silent.loop.Advance(2000);
+	EXPECT_EQ(silent.api.deferred.size(), Count(1));
+	EXPECT_EQ(silent.Status(), DeferredLinkStatus::Delivered);
+}
+
+TEST(DeferredMatching, OnlyOneOfTheTwoFlowsDelivers)
+{
+	// A paste while the match request is in flight: the paste wins, the match answer is dropped.
+	Deferred d("ios");
+	d.config.allowProbabilisticMatching = true;
+	d.config.timeoutMs = 5000;
+	d.api.onDeferred = [](const HttpRequest& request) {
+		return request.url == kMatchUrl ? Hang() : Respond(200, DeferredBody());
+	};
+	d.Make();
+	d.Listen();
+	EXPECT(d.Start());
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+	d.Paste(kPasted);
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.back(), PastedLinkResult::Delivered);
+	EXPECT(d.api.Complete(d.api.deferredIds[0], Respond(200, MatchedBody())));
+	d.loop.Advance(60000);
+	EXPECT_EQ(d.received.size(), Count(1));
+	EXPECT(!d.received[0].isProbabilisticMatch);
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+
+	// The other way round: the match delivers while the paste request is in flight.
+	Deferred m("ios");
+	m.config.allowProbabilisticMatching = true;
+	m.config.timeoutMs = 5000;
+	m.api.onDeferred = [](const HttpRequest& request) {
+		return request.url == kMatchUrl ? Respond(200, MatchedBody()) : Hang();
+	};
+	m.Make();
+	m.Listen();
+	m.Paste(kPasted); // before start: the paste request hangs
+	EXPECT(m.Start());
+	EXPECT_EQ(m.received.size(), Count(1));
+	EXPECT(m.received[0].isProbabilisticMatch);
+	EXPECT(m.api.Complete(m.api.deferredIds[0], Respond(200, DeferredBody())));
+	EXPECT_EQ(m.pasted.back(), PastedLinkResult::AlreadyHandled);
+	EXPECT_EQ(m.received.size(), Count(1));
 }
 
 // ---------------------------------------------------------------------------------------------

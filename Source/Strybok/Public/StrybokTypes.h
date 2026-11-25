@@ -32,11 +32,102 @@ enum class EStrybokErrorKind : uint8
 };
 
 /**
+ * Where the check for a deferred link (a link tapped before the game was installed) stands. Most
+ * installs never involved a link, so finding nothing is the normal result. Nothing about the
+ * check is ever reported through OnLinkError.
+ */
+UENUM(BlueprintType)
+enum class EStrybokDeferredLinkStatus : uint8
+{
+	/** Deferred links are off, or something they need is missing: Android or iOS, the package name / bundle id, or the SDK is not configured. */
+	Disabled,
+	/** The check is running in this launch. */
+	Checking,
+	/** Not started yet, or this launch could not finish it (store or network not reachable); a later launch tries again. */
+	Pending,
+	/** The check was finished in an earlier launch. */
+	NotFirstLaunch,
+	/** Android: no install referrer source is registered, or none can ever answer. iOS: nothing automatic is switched on (only a pasted link can arrive). */
+	Unavailable,
+	/** The store returned a referrer without a click id of ours: the usual result of an ordinary install. */
+	NoReferrer,
+	/** The service refused: unknown, older than allowed, already used, or not this application's. */
+	NotFound,
+	/** A normal link of this app arrived first. */
+	Superseded,
+	/** The link was handed to OnLinkReceived (or queued for it). */
+	Delivered,
+	/** Three launches could not finish the check, or the service's answer was unusable. */
+	Failed,
+	/** iOS matching only: waiting for RedeemPastedLink or SkipPastedLink, because the pasteboard may hold a link. */
+	AwaitingPaste,
+};
+
+/** Result of UStrybokSubsystem::RedeemPastedLink. */
+UENUM(BlueprintType)
+enum class EStrybokPastedLinkResult : uint8
+{
+	/** The link was handed to OnLinkReceived (or queued for it). */
+	Delivered,
+	/** Not a link of this app with a click id. Nothing was sent anywhere; the text was dropped. */
+	NotOurs,
+	/** The service refused the click id: unknown, older than 24 hours, already used, or another app's. */
+	NotFound,
+	/** A deferred link was already handled for this installation. */
+	AlreadyHandled,
+	/** Deferred links are off, this is not iOS, the bundle id is missing, or the SDK is not configured. */
+	Disabled,
+	/** Usually temporary (network, rate limit, server error): the player may paste again. Final only when the status became Failed. */
+	Failed,
+};
+
+/**
+ * Campaign values of an opened link: the usual utm_source, utm_medium, utm_campaign, utm_term and
+ * utm_content of web analytics. An empty string means the value is not set.
+ *
+ * They are the defaults the owner set on the link, overridden by the utm_* parameters of the URL
+ * that was tapped. Whoever shares a link can write any value into its URL, so treat them as labels
+ * (for your analytics, say), never as something to trust or to act on.
+ */
+USTRUCT(BlueprintType)
+struct STRYBOK_API FStrybokCampaign
+{
+	GENERATED_BODY()
+
+	/** utm_source, for example "instagram". Empty when not set. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Source;
+
+	/** utm_medium, for example "social". Empty when not set. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Medium;
+
+	/** utm_campaign, for example "spring_sale". Empty when not set. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Campaign;
+
+	/** utm_term. Empty when not set. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Term;
+
+	/** utm_content. Empty when not set. */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FString Content;
+
+	/** True when the link has no campaign value at all. */
+	bool IsEmpty() const
+	{
+		return Source.IsEmpty() && Medium.IsEmpty() && Campaign.IsEmpty() && Term.IsEmpty() && Content.IsEmpty();
+	}
+};
+
+/**
  * A link resolved by the Strybok API.
  *
- * RoutePath and PayloadJson are plain data chosen by whoever created the link. Treat them like any
- * other untrusted input: map them onto levels and screens your game already knows, never execute
- * them (no console commands, no arbitrary level names, no asset paths taken from a link).
+ * RoutePath, PayloadJson and Campaign are plain data chosen by whoever created or shared the link.
+ * Treat them like any other untrusted input: map them onto levels and screens your game already
+ * knows, never execute them (no console commands, no arbitrary level names, no asset paths taken
+ * from a link), and use campaign values as labels only.
  */
 USTRUCT(BlueprintType)
 struct STRYBOK_API FStrybokResolvedLink
@@ -60,6 +151,28 @@ struct STRYBOK_API FStrybokResolvedLink
 	/** The JSON object attached to the link, as text. "{}" when none was set. */
 	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
 	FString PayloadJson = TEXT("{}");
+
+	/**
+	 * Campaign values of this open: the link's defaults, overridden by the utm_* parameters of the
+	 * tapped URL. All five strings are empty when there are none.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	FStrybokCampaign Campaign;
+
+	/**
+	 * True when the link was restored after the game was installed (deferred links) instead of
+	 * arriving from the OS. Then Uri is the link's own URL. False for every other link.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	bool bIsDeferred = false;
+
+	/**
+	 * True only for a deferred link found by iOS probabilistic matching. Such a link is a guess
+	 * from the network address and MAY BE ANOTHER PERSON'S LINK: never sign anyone in, accept an
+	 * invitation, apply a personal discount or show personal content on the strength of it alone.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Strybok")
+	bool bIsProbabilisticMatch = false;
 
 	/**
 	 * Reads one top-level payload field as text. Works for string fields; numbers and booleans are
@@ -212,7 +325,84 @@ struct STRYBOK_API FStrybokConfig
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok")
 	FString ClientKey;
+
+	/**
+	 * Restore a link that was tapped before the game was installed. Off by default; can also be
+	 * switched on later with UStrybokSubsystem::EnableDeferredLinks (for example after a consent
+	 * screen). Android: needs AndroidPackageName and an install referrer source registered by the
+	 * game. iOS: needs IosBundleId; enables RedeemPastedLink.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Deferred links")
+	bool bDeferredLinks = false;
+
+	/**
+	 * iOS only, together with bDeferredLinks: let the service guess the link from the network
+	 * address on first launch. FORBIDDEN BY APPLE'S RULES (it is fingerprinting; the App Review and
+	 * legal risk is yours), and a match can be another person's link. Off by default.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Deferred links")
+	bool bAllowProbabilisticMatching = false;
+
+	/** The game's own Android application ID, e.g. com.example.game. Only used by deferred links. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Deferred links")
+	FString AndroidPackageName;
+
+	/** The game's own iOS bundle identifier. Only used by deferred links. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Deferred links")
+	FString IosBundleId;
 };
+
+/** What an install referrer source answers (Android deferred links). */
+enum class EStrybokInstallReferrerAnswer : uint8
+{
+	/** Referrer holds the store's raw install referrer string, exactly as returned (it may be empty). */
+	Referrer,
+	/** The store could not be asked right now; a later launch may succeed. */
+	UnavailableForNow,
+	/** This store is not on the device, is too old, or its library is not in the game. */
+	Unavailable,
+};
+
+struct FStrybokInstallReferrerAnswer
+{
+	EStrybokInstallReferrerAnswer Kind = EStrybokInstallReferrerAnswer::Unavailable;
+	FString Referrer;
+
+	static FStrybokInstallReferrerAnswer MakeReferrer(const FString& RawReferrer)
+	{
+		FStrybokInstallReferrerAnswer Answer;
+		Answer.Kind = EStrybokInstallReferrerAnswer::Referrer;
+		Answer.Referrer = RawReferrer;
+		return Answer;
+	}
+
+	static FStrybokInstallReferrerAnswer MakeUnavailableForNow()
+	{
+		FStrybokInstallReferrerAnswer Answer;
+		Answer.Kind = EStrybokInstallReferrerAnswer::UnavailableForNow;
+		return Answer;
+	}
+
+	static FStrybokInstallReferrerAnswer MakeUnavailable()
+	{
+		return FStrybokInstallReferrerAnswer();
+	}
+};
+
+/**
+ * One store's install referrer, supplied by the game (the plugin has no store integration of its
+ * own). Called on the game thread and must not block it: start the store's asynchronous call and
+ * return. Call Complete exactly once, from any thread, with the answer. An answer later than 10
+ * seconds is treated as "unavailable for now" and ignored. Must not throw.
+ */
+using FStrybokInstallReferrerSource = TFunction<void(TFunction<void(const FStrybokInstallReferrerAnswer&)> /*Complete*/)>;
+
+/** The status of the deferred link check changed. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FStrybokDeferredLinkStatusChanged, EStrybokDeferredLinkStatus, Status);
+DECLARE_MULTICAST_DELEGATE_OneParam(FStrybokDeferredLinkStatusChangedNative, EStrybokDeferredLinkStatus /*Status*/);
+
+/** Result of UStrybokSubsystem::RedeemPastedLink. */
+DECLARE_DYNAMIC_DELEGATE_OneParam(FStrybokPastedLinkCompleted, EStrybokPastedLinkResult, Result);
 
 /** A resolved link, delivered exactly once. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FStrybokLinkReceived, const FStrybokResolvedLink&, Link);

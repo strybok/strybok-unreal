@@ -78,6 +78,32 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Link creation")
 	FString ClientKey;
 
+	/**
+	 * Restore a link that was tapped before the game was installed. Off by default. With it on, the
+	 * check runs right after start-up; leave it off and call UStrybokSubsystem::EnableDeferredLinks
+	 * instead when the player has to consent first, or when your install referrer sources are
+	 * registered later than the first frame. See the integration guide: on Android the game must
+	 * supply the install referrer itself, on iOS the player must paste the link.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Deferred links", meta = (DisplayName = "Deferred Links"))
+	bool bDeferredLinks = false;
+
+	/**
+	 * iOS only, together with Deferred Links: let the service guess the link from the network
+	 * address. FORBIDDEN BY APPLE'S RULES (fingerprinting); the App Review and legal risk is yours,
+	 * and a match can be another person's link. Off by default.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Deferred links", meta = (DisplayName = "Allow Probabilistic Matching (iOS, forbidden by Apple)"))
+	bool bAllowProbabilisticMatching = false;
+
+	/** The game's own Android application ID (the "Android Package Name" of the Android platform settings). Deferred links on Android stay disabled without it. */
+	UPROPERTY(Config, EditAnywhere, Category = "Deferred links")
+	FString AndroidPackageName;
+
+	/** The game's own iOS bundle identifier. Deferred links on iOS stay disabled without it. */
+	UPROPERTY(Config, EditAnywhere, Category = "Deferred links")
+	FString IosBundleId;
+
 	/** These settings as a config for UStrybokSubsystem::Configure. */
 	FStrybokConfig ToConfig() const;
 };

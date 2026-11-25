@@ -10,3 +10,8 @@ TArray<FString> UStrybokBlueprintLibrary::GetRouteSegments(const FStrybokResolve
 {
 	return Link.GetRouteSegments();
 }
+
+bool UStrybokBlueprintLibrary::HasCampaign(const FStrybokResolvedLink& Link)
+{
+	return !Link.Campaign.IsEmpty();
+}

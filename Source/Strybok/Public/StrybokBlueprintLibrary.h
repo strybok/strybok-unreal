@@ -22,4 +22,8 @@ public:
 	/** The route split at "/": "/invite/abc123" gives ["invite", "abc123"]. */
 	UFUNCTION(BlueprintPure, Category = "Strybok", meta = (DisplayName = "Get Route Segments"))
 	static TArray<FString> GetRouteSegments(const FStrybokResolvedLink& Link);
+
+	/** Whether the link came with at least one campaign value (utm_source and the like). */
+	UFUNCTION(BlueprintPure, Category = "Strybok", meta = (DisplayName = "Has Campaign"))
+	static bool HasCampaign(const FStrybokResolvedLink& Link);
 };
