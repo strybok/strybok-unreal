@@ -19,7 +19,7 @@ iOS. An SDK version without the `deferredLinks` option restores nothing after in
 | Option                       | Default  | Meaning                                                                                                                                                                                                                                                                                                                    |
 | ---------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apiBaseUrl`                 | required | Base URL of the API, e.g. `https://api.strybok.com`. A path prefix is preserved.                                                                                                                                                                                                                                           |
-| `allowedHosts`               | required | Link hostnames of this app, compared lower-case. Other hosts are ignored.                                                                                                                                                                                                                                                  |
+| `allowedHosts`               | required | Link hostnames of this app, compared lower-case: the managed hostname, every active custom domain and, while "Open in the app" for iOS in-app browsers is on, the alternate hostname of the application (`allowedHosts` of `GET /v1/apps/:appId/integration`). Other hosts are ignored.                                    |
 | `timeout`                    | 5 s      | Time allowed for one resolve attempt.                                                                                                                                                                                                                                                                                      |
 | `maxRetries`                 | 2        | Extra attempts after a timeout, network error or 5xx.                                                                                                                                                                                                                                                                      |
 | `retryDelay`                 | 400 ms   | Pause before the first retry; doubles for each further retry.                                                                                                                                                                                                                                                              |
@@ -30,6 +30,7 @@ iOS. An SDK version without the `deferredLinks` option restores nothing after in
 | `attestation`                | `false`  | Prove to the server that this is the genuine app before creating links. Only SDKs that support it have this option (Android also needs `cloudProjectNumber`), see [Attestation](#attestation-optional).                                                                                                                    |
 | `deferredLinks`              | `false`  | Restore a link that was tapped before the app was installed. Android: ask the store for its install referrer on the first launch, see [Deferred links](#deferred-links-optional-android). iOS: only the two flows of [Deferred links on iOS](#deferred-links-on-ios-optional). Only SDKs that support it have this option. |
 | `allowProbabilisticMatching` | `false`  | iOS only, and only together with `deferredLinks`: let the server guess the link from the network address, see [Probabilistic matching](#flow-b-probabilistic-matching). Forbidden by Apple's rules; the app developer opts in here in code, separately from the owner's setting.                                           |
+| `parameterLinks`             | none     | Deliver links without an API call (path links and Firebase long links) and send these query keys with them: `{ payloadKeys: [...] }`, the value of `parameterLinks` in `GET /v1/apps/:appId/integration`. See [Links without an API call](#links-without-an-api-call). Without it the SDK behaves exactly as before.       |
 
 The source of incoming URLs (`LinkSource`: a launch URL plus a stream of later URLs) and the HTTP
 transport are replaceable, so the SDK can be tested without a device or a network.
@@ -42,17 +43,146 @@ A URL is a Strybok link of this app only when **all** of these hold:
 - host, lower-cased, is in `allowedHosts`;
 - no user info (`user:pass@`);
 - no port, or port 443;
-- path matches `^/[A-Za-z0-9_-]{1,64}$` (exactly one slug segment, no trailing slash).
+- path matches `^/[A-Za-z0-9_-]{1,64}$` (exactly one slug segment, no trailing slash) — or, only
+  with the `parameterLinks` option, is a route path or a Firebase long link as described in
+  [Links without an API call](#links-without-an-api-call).
 
-Query and fragment are allowed and do not decide whether a URL is ours. Anything else is dropped
-silently by the automatic flow (no error, no network call) and rejected with `UnsupportedLink` by
-`resolve`.
+Query and fragment are allowed and do not decide whether a URL is ours (except the `link`
+parameter of a long link). Anything else is dropped silently by the automatic flow (no error, no
+network call) and rejected with `UnsupportedLink` by `resolve`.
+
+## Links without an API call
+
+_Added on 2026-11-28 (decision 0035): iOS, Android and
+Kotlin Multiplatform 0.5.0, the other SDKs 0.4.0. Optional; without the option an SDK sends
+exactly the requests of its previous version._
+
+An application can let any address of its hosts open a route of the app without creating a link
+first (decision 0033, off by default per application):
+**path links** such as `https://<host>/product/42?id=7`, where the owner allows route patterns and
+names the query keys that become the payload, and **Firebase long links**
+`https://<host>/?link=<deep link>&apn=…&ibi=…`. The server decides everything — whether the route
+is allowed, what the payload is, which campaign values count — and answers `resolve` with the
+route and payload it read. The SDK only has to recognise these URLs and send them without
+anything private.
+
+### The option
+
+`parameterLinks` is an object with one field, `payloadKeys`: the list of query keys the owner
+allows, in the owner's order (`parameterLinks.payloadKeys` of the integration guide,
+`GET /v1/apps/:appId/integration`). The guide gives `null` while both kinds are off; the app then
+does not set the option. A configuration is **invalid**, and the SDK rejects it the way it
+rejects an invalid `apiBaseUrl`, when `payloadKeys` has more than 20 keys, a key twice, or a key
+that is not 1–40 characters of `A–Z a–z 0–9 _ . -`, starts with `utm_` in any case, or is `st`,
+`sd`, `si` or `strybok_click` (compared exactly: `ST` is an ordinary key). An empty list is valid:
+path links then carry no payload.
+
+The keys are compiled into the app. When the owner changes them in the dashboard, builds that
+are already installed keep sending the keys they know, and the server ignores keys it no longer
+allows: a new key reaches users with the next app release.
+
+### Which URLs are ours, with the option
+
+The scheme, host, user info and port rules above are unchanged. Then, in this order:
+
+1. **A slug.** A path of exactly one slug segment (`^/[A-Za-z0-9_-]{1,64}$`) is ours, as without
+   the option. The server answers it as a stored link when one has that slug, and as a path link
+   otherwise.
+2. **An empty path** is read as `/` (`https://host?x=1` is `https://host/?x=1`). Without the
+   option an empty path is not ours, as before.
+3. **A Firebase long link.** A path of exactly `/` whose query has a parameter named `link`
+   (decoded as in the campaign query, first occurrence) is a long link. It is ours when that first
+   value can be decoded and is a **deep link**: `scheme://host` followed by an optional path, query
+   and fragment, where the scheme is `http` or `https` in any case; the host is one or more of
+   `A–Z a–z 0–9 . - _` (no user info, no port; an IPv6 address in brackets is not ours,
+   while a dotted IPv4 address passes and the server refuses it); and the whole value contains no
+   character at or below U+0020, no U+007F and no `\`. Otherwise the URL is not ours. (`link` on
+   any other path is an ordinary query parameter.)
+4. **A route path.** Any other path is ours when it is a route path:
+   - 1–512 characters, starting with `/`;
+   - only `A–Z a–z 0–9 - . _ ~ ! $ & ' ( ) * + , ; = : @ %` and `/`, every `%` followed by two
+     hexadecimal digits (the path is taken as received: never decoded or normalised);
+   - no `//`, and no segment that is `.` or `..` after `%2e` or `%2E` is read as `.`;
+   - not reserved: not `/.well-known` or `/_strybok` or anything under them, and not exactly one
+     of `/favicon.ico`, `/robots.txt`, `/apple-touch-icon.png`,
+     `/apple-touch-icon-precomposed.png`, `/sitemap.xml`, `/ads.txt`, `/app-ads.txt`,
+     `/security.txt`, `/humans.txt`, `/manifest.json`, `/site.webmanifest`, `/browserconfig.xml`.
+
+   A trailing slash is allowed (`/product/`); the server decides that no route matches it.
+
+Whether the owner has switched a kind on, which routes are allowed and which web domains a deep
+link may name is the server's business: a URL that passes these rules but is no link answers
+404, which is `LinkNotFound`, like an unknown slug.
+
+### What is sent
+
+`lookup` is built as in [Resolving](#resolving), with one more part of the query:
+
+- **For a slug or a route path:** `https://{lower-cased host}{path}`, then the **payload query**,
+  then the campaign query. The payload query has, for each key of `payloadKeys` in the order of
+  the option, the key's **first** occurrence in the tapped URL's query (split and decoded exactly
+  like the campaign query, so `+` is a space and keys are compared after decoding, with case),
+  kept when its decoded value is 1–256 UTF-16 code units long and has no character in
+  U+0000–U+001F or U+007F–U+009F. A first occurrence that cannot be decoded, or that breaks these
+  rules, drops the key; a later occurrence never counts.
+- **For a Firebase long link:** `https://{lower-cased host}/?link={deep}`, then `&apn=…` and
+  `&ibi=…` when the tapped URL has them, then the campaign query. `deep` is the deep link rebuilt
+  as `{lower-cased scheme}://{lower-cased host}{path}` (`/` when the path is empty) followed by the
+  payload query of the deep link's own query, without its fragment; the rest of the deep link's
+  query is never sent. `apn` and `ibi` are the first occurrence of each, sent as they are, even
+  empty — the server compares them with the application's identifiers and refuses a mismatch, as
+  the link host does; a first occurrence that cannot be decoded makes the URL not ours. Nothing
+  else of the tapped URL is sent: not `afl`, `ifl`, `ofl`, `st`, `sd`, `si`, `isi` or any other
+  parameter.
+- **Encoding:** every payload value, `deep`, `apn` and `ibi` is written as its UTF-8 bytes, each
+  byte outside `A–Z a–z 0–9 - . _ ~` as `%XX` with upper-case hexadecimal digits (so a space is
+  `%20` and `+` is `%2B`). Payload keys and campaign values never need encoding. The pairs are
+  joined with `&`: payload pairs first, then the campaign pairs; with no pair at all, `lookup` has
+  no `?`. `lookup` as a whole is then percent-encoded as the value of `url`, as before.
+
+Examples, with `payloadKeys: ["id", "lang"]`:
+
+| Tapped                                                                                                       | `lookup`                                                                                  |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `https://myapp.strybok.link/product/42?utm_source=newsletter&ref=x&lang=uk&id=7#reviews`                     | `https://myapp.strybok.link/product/42?id=7&lang=uk&utm_source=newsletter`                |
+| `https://myapp.strybok.link/search?id=a+b%2Bc`                                                               | `https://myapp.strybok.link/search?id=a%20b%2Bc`                                          |
+| `https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7%26secret%3Dx&apn=com.example.app&isi=1` | `https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7&apn=com.example.app` |
+| `https://myapp.strybok.link/a/../b`                                                                          | not ours                                                                                  |
+
+**Test vectors.** Every SDK keeps a byte-identical copy of the shared file
+`parameter-links-vectors.json` with its tests and runs all of it: 90 tapped URLs with the
+expected `lookup` (or "not ours") and 19 options with whether they are valid. The SDK must agree
+on every case; a test in the Strybok repository checks that every copy is the same file.
+
+The SDK may send less than a browser visit would: a value it cannot decode is dropped, where a
+browser's parser would turn it into replacement characters. It never sends more.
+
+### The answer
+
+`resolve` answers a path or long link like any link, by the table in [Resolving](#resolving): a
+resolved link with `linkId` (the id the server counts these opens under, one per kind and
+application — opaque to the app), `appId`, `routePath` (the route the server read, which is the
+one to navigate to — never the tapped path), `payload` (an object of strings: the allowed keys
+that the server kept) and `campaign`. Delivery, de-duplication (the full URL string as received)
+and the `app_open` event are unchanged; `app_open` carries that `linkId`.
+
+### What does not change
+
+- **Deferred links.** The server offers deferred links only for stored links, so the URL in a
+  deferred-link answer, and the pasted text of iOS flow A (a copied `/<slug>?strybok_click=…`
+  link), must still be one slug segment: the SDK keeps the slug rule there with or without the
+  option.
+- **`createLink`** is unchanged.
+- **Without the option** nothing changes: the five rules above with the slug path, the campaign
+  query only.
 
 ## Resolving
 
 `GET {apiBaseUrl}/v1/public/resolve?url={lookup}` with `Accept: application/json`, where `lookup`
 is `https://{lower-cased host}{path}` followed by the **campaign query** described below. The rest
-of the query and the fragment are **never** sent, they may hold private data.
+of the query and the fragment are **never** sent, they may hold private data. The one addition is
+the `parameterLinks` option: with it the SDK also sends the values of the query keys the app
+configured, as [Links without an API call](#links-without-an-api-call) describes.
 
 ### Campaign query
 
@@ -910,7 +1040,11 @@ at all, only a [status](#status-and-errors).
 SDKs collect no device identifiers, no advertising IDs and no fingerprint. The only data sent is
 the link host and slug plus the five `utm_*` campaign parameters of the tapped URL when they pass
 the character rule (resolve) — never any other query parameter or the fragment —, the event
-above, and — only when the app calls `createLink` —
+above, with the `parameterLinks` option the path of a path link and the values of the configured
+payload keys, or for a Firebase long link the deep link's scheme, host and path, its values of
+those keys and the `apn` and `ibi` parameters (see
+[Links without an API call](#links-without-an-api-call); app developers must not configure keys
+that carry personal data), and — only when the app calls `createLink` —
 the client key and the route, payload, title, description and image URL the app passed in. Apps
 must not put personal data in a route or payload: whoever receives the link can read them. With
 `attestation` switched on, `createLink` also sends what

@@ -327,6 +327,25 @@ struct STRYBOK_API FStrybokConfig
 	FString ClientKey;
 
 	/**
+	 * Links without an API call: deliver path links (https://<host>/product/42?id=7) and Firebase
+	 * long links (https://<host>/?link=...) of the allowed hosts. Off by default: then only links
+	 * with a single slug path are ours. Switch it on when the integration guide
+	 * (GET /v1/apps/:appId/integration, shown on the dashboard's setup screen) has parameterLinks,
+	 * and copy its payloadKeys into PayloadKeys. Deferred links keep the slug rule.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Links without an API call")
+	bool bParameterLinks = false;
+
+	/**
+	 * parameterLinks.payloadKeys of the integration guide, in its order: the query keys whose values
+	 * are sent with a path link and become its payload. At most 20 keys of A-Z a-z 0-9 _ . - (not
+	 * utm_..., st, sd, si, strybok_click); an invalid list makes Configure fail. Never a key that
+	 * carries personal data. Only used with bParameterLinks; blank entries are ignored.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Strybok|Links without an API call")
+	TArray<FString> PayloadKeys;
+
+	/**
 	 * Restore a link that was tapped before the game was installed. Off by default; can also be
 	 * switched on later with UStrybokSubsystem::EnableDeferredLinks (for example after a consent
 	 * screen). Android: needs AndroidPackageName and an install referrer source registered by the

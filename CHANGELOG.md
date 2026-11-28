@@ -1,3 +1,34 @@
+## 0.4.0
+
+- Links without an API call, optional and **off by default; covered by the standalone core
+  tests only, never run on a device**. Settings and `FStrybokConfig`: `bParameterLinks` and
+  `PayloadKeys` (trimmed, blank entries ignored), the value of `parameterLinks` in the
+  integration guide. With it, path links (`https://<host>/product/42?id=7`) and Firebase long
+  links (`https://<host>/?link=…`) of the allowed hosts are links of this game, for links from the
+  OS, `HandleUrl`, `ResolveUrl` and `IsStrybokUrl` alike. The resolve request carries the path
+  exactly as received (never decoded or normalised), the first value of each configured payload
+  key (1–256 UTF-16 code units, counted explicitly; no control characters; re-encoded byte by
+  byte) and the `utm_*` values; for a long link the deep link rebuilt from its scheme, host and
+  path with only its payload keys, plus `apn` and `ibi`. Nothing else of the URL is sent.
+- The delivered link has the route and payload of the server's answer, never the tapped path;
+  `app_open` carries the answer's `linkId`. With the option an address of the allowed hosts that
+  is no link is reported through `OnLinkError` as `LinkNotFound`.
+- An invalid list (more than 20 keys, a key twice, a key that is not 1–40 characters of
+  `A–Z a–z 0–9 _ . -`, `utm_…` in any case, `st`, `sd`, `si`, `strybok_click`) makes `Configure`
+  fail like an unusable `ApiBaseUrl` (`strybok::ValidateConfig`).
+- Without the option every request is byte for byte what 0.3.0 sent. Deferred links (the URL of a
+  redeem or match answer, and pasted text) keep the single-slug rule with or without it;
+  `CreateLink` is unchanged.
+- Core: `strybok::ParameterLinks`, `Config::parameterLinks` (`std::optional`, absent by default),
+  `ValidateParameterLinks`, and `IsStrybokUrl` / `BuildLookupUrl` overloads that take the option
+  (the existing ones keep the slug rule). The standalone tests read every case of the shared test
+  vectors of the SDK contract (`Tests/Fixtures/parameter-links-vectors.json`) with the core's own
+  JSON reader and run each through the rules, `Resolve` and the automatic flow (C++17 and C++20,
+  AddressSanitizer and UBSan).
+- `app_open` events report `sdkVersion` `0.4.0`; `Version` in `Strybok.uplugin` is now 4.
+- The Unreal module part of this (the settings, `FStrybokConfig`, the conversion in
+  `StrybokRuntime.cpp`) is, like the rest of the module, not compiled against Unreal Engine yet.
+
 ## 0.3.0
 
 - Campaign values. `FStrybokResolvedLink::Campaign` (`FStrybokCampaign`, Blueprint-readable:

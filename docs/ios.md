@@ -48,6 +48,32 @@ handles links:
 <false/>
 ```
 
+### Custom domain (optional)
+
+An application can also serve its links on a subdomain of your own, such as `go.example.com`
+(decision 0020): you add it on the Setup tab under
+**Custom domain** and create the two DNS records shown there — first
+`TXT _strybok-challenge.<hostname>` with the `strybok-verification=…` value, which proves the
+domain is yours, then the CNAME, through which Cloudflare validates the hostname and issues its
+certificate. When both are seen the domain is active, and Strybok serves the same association file on it. Once it is
+**active**, declare it next to the managed hostname and keep both:
+
+```xml
+<key>com.apple.developer.associated-domains</key>
+<array>
+    <string>applinks:<your managed hostname></string>
+    <string>applinks:go.example.com</string>
+</array>
+```
+
+Pass both hostnames to the SDK's `allowedHosts` as well. `GET /v1/apps/:appId/integration`
+returns the entitlement with every active custom domain filled in and the list as `allowedHosts`.
+Links on the custom domain open the app only in app versions that declare it: release such a
+version first, then make the domain **primary** so that new link URLs use it. Until then link
+URLs stay on the managed hostname, and links already shared with either hostname keep working.
+Custom domains were tried end to end with a real domain on Cloudflare; Universal Links on a custom
+domain have not been tried on a device yet.
+
 ## 3. Verify on a device
 
 - Use a **physical device**. Install the build, then tap a link in Notes or Messages.
@@ -79,6 +105,10 @@ is visible only on the device.
 
 Changing the hostname in the entitlement requires shipping an app update.
 
+The dashboard shows Apple's CDN copy of the file per hostname (setup screen, "Diagnostics: what
+Apple and Google see") and simulates a tap on any link (link details, "Test this link"), each
+with what to do.
+
 ### Links opened from Instagram, TikTok and other apps
 
 Instagram, Facebook, Messenger, TikTok, LinkedIn, Snapchat, LINE, WeChat and similar apps open
@@ -90,14 +120,22 @@ of redirecting to the App Store: the link's title and description, the App Store
 button, and a line telling the visitor to choose "Open in Safari" / "Open in browser" from the
 app's menu.
 
-**There is no "Open in the app" button on iOS.** A page cannot open your app from the link's own
-domain: Apple opens same-domain links in the browser, and the SDKs do not use custom URL schemes.
-Leaving the built-in browser through its menu is the only route offered, and whether that lands
-in your app or in Safari depends on the host app. X on iOS is probably not recognised at all and
-is redirected as before.
+**"Open in the app" on iOS is optional and off by default.** A page cannot open your app from
+the link's own domain: Apple opens same-domain links in the browser. So every app also has an
+**alternate hostname**, its hostname with `--alt` (`my-app-x7k2q9--alt.strybok.link`), which serves
+the same links. To use it, add `applinks:<alternate hostname>` to the Associated Domains
+entitlement and the alternate hostname to the SDK's `allowedHosts` (the SDK ignores links on other
+hosts), release that version, then switch on "Open in the app" for iPhone on the setup screen
+("When a link opens in a browser"). The page then starts with a button to the same link on the
+other hostname; whether the in-app browser lets iOS open your app is up to that app (Instagram
+reportedly never does). Without the switch, leaving the built-in browser through its menu is the
+only route offered, and whether that lands in your app or in Safari depends on the host app. X on
+iOS is probably not recognised at all and is redirected as before. The SDKs do not use custom URL
+schemes.
 
 None of this has been verified inside the real apps or on a device. Details and the options that
-were not taken: decision 0017.
+were not taken: decision 0017 and
+decision 0034.
 
 ## Links tapped before the app is installed
 

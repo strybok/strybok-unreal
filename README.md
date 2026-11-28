@@ -41,6 +41,28 @@ Strybok->CreateLinkNative(Request, [](bool bSuccess, const FStrybokCreatedLink& 
 Full guide (installation, Project Settings, iOS and Android setup, Blueprint, errors,
 troubleshooting, known gaps): [`docs/unreal.md`](./docs/unreal.md).
 
+## Links without an API call (optional)
+
+Path links (`https://my-app.strybok.link/product/42?id=7`) and Firebase long links
+(`https://my-app.strybok.link/?link=…`) open a route without a link made in advance, once the
+owner switched them on. Copy `parameterLinks` of the integration guide
+(`GET /v1/apps/:appId/integration`, shown on the dashboard's setup screen) into the Project
+Settings:
+
+```ini
+; Config/DefaultGame.ini
+[/Script/Strybok.StrybokSettings]
+bParameterLinks=True
++PayloadKeys=id
++PayloadKeys=lang
+```
+
+(or `bParameterLinks` / `PayloadKeys` of `FStrybokConfig`). Only the path and the values of these
+keys are sent, and `RoutePath` / `PayloadJson` of the link are what the server read, never the
+tapped path. Off by default; without it nothing changes. New in 0.4.0: the rules are in the
+tested core, the settings around them are not compiled with Unreal Build Tool yet. Details:
+[guide](./docs/unreal.md#links-without-an-api-call-optional).
+
 ## Deferred links (optional)
 
 Restoring a link that was tapped before the game was installed is **off by default**

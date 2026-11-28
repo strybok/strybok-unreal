@@ -9,7 +9,7 @@
 namespace strybok
 {
 
-const char* const kSdkVersion = "0.3.0";
+const char* const kSdkVersion = "0.4.0";
 
 IHttpTransport::~IHttpTransport() = default;
 IScheduler::~IScheduler() = default;
@@ -195,8 +195,12 @@ const char* const kCampaignQueryKeys[] = {"utm_source", "utm_medium", "utm_campa
 const std::size_t kCampaignKeyCount = sizeof(kCampaignQueryKeys) / sizeof(kCampaignQueryKeys[0]);
 const std::size_t kMaxCampaignValueLength = 64;
 
-/** The single place that decides whether a URL is ours. */
-bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, OurUrl& outParts)
+/**
+ * The single place that checks the scheme, host, user info and port of a URL. Without `anyPath`
+ * the path must be exactly one slug segment; with it (the `parameterLinks` option) any path is
+ * returned as received, possibly empty, for the rules of `BuildParameterLinkLookup`.
+ */
+bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, bool anyPath, OurUrl& outParts)
 {
 	// Scheme: https only (case-insensitive, like every URL parser).
 	if (!StartsWithIgnoreCase(url, "https://"))
@@ -249,14 +253,15 @@ bool ParseOurUrl(const std::string& url, const std::vector<std::string>& normali
 		return false;
 	}
 
-	// Exactly one slug segment; query and fragment do not decide anything.
+	// Exactly one slug segment; query and fragment do not decide anything. (The path starts right
+	// after the authority, so with `anyPath` it is empty or starts with "/".)
 	std::size_t pathEnd = url.find_first_of("?#", authorityEnd);
 	if (pathEnd == std::string::npos)
 	{
 		pathEnd = url.size();
 	}
 	const std::string path = url.substr(authorityEnd, pathEnd - authorityEnd);
-	if (!IsSlugPath(path))
+	if (!anyPath && !IsSlugPath(path))
 	{
 		return false;
 	}
@@ -824,19 +829,30 @@ std::string ValidateConfig(const Config& config)
 	{
 		return "dedupeWindow must not be negative";
 	}
+	if (config.parameterLinks)
+	{
+		return ValidateParameterLinks(*config.parameterLinks);
+	}
 	return std::string();
 }
 
 bool IsStrybokUrl(const std::string& url, const std::vector<std::string>& normalizedHosts)
 {
 	OurUrl parts;
-	return ParseOurUrl(url, normalizedHosts, parts);
+	return ParseOurUrl(url, normalizedHosts, false, parts);
+}
+
+bool IsStrybokUrl(
+	const std::string& url, const std::vector<std::string>& normalizedHosts, const ParameterLinks* parameterLinks)
+{
+	std::string lookup;
+	return BuildLookupUrl(url, normalizedHosts, parameterLinks, lookup);
 }
 
 bool BuildLookupUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, std::string& outLookup)
 {
 	OurUrl parts;
-	if (!ParseOurUrl(url, normalizedHosts, parts))
+	if (!ParseOurUrl(url, normalizedHosts, false, parts))
 	{
 		return false;
 	}
@@ -924,6 +940,560 @@ std::string PercentEncode(const std::string& value)
 		}
 	}
 	return result;
+}
+
+// --- links without an API call (SDK contract, "Links without an API call") ---
+
+namespace
+{
+
+const std::size_t kMaxPayloadKeys = 20;
+const std::size_t kMaxPayloadKeyLength = 40;
+const std::size_t kMaxPayloadValueUnits = 256;
+
+const char* const kReservedPayloadKeys[] = {"st", "sd", "si", "strybok_click"};
+
+/** Never a link, and neither is anything under them. */
+const char* const kReservedPathPrefixes[] = {"/.well-known", "/_strybok"};
+
+/** Paths browsers and crawlers ask for on their own; reserved exactly. */
+const char* const kReservedPathFiles[] = {"/favicon.ico", "/robots.txt", "/apple-touch-icon.png",
+	"/apple-touch-icon-precomposed.png", "/sitemap.xml", "/ads.txt", "/app-ads.txt", "/security.txt", "/humans.txt",
+	"/manifest.json", "/site.webmanifest", "/browserconfig.xml"};
+
+/**
+ * Whether `text` is well-formed UTF-8 (Unicode table 3-7: no overlong forms, surrogates, values
+ * beyond U+10FFFF or stray continuation bytes). `outUnits` is its length in UTF-16 code units,
+ * `outControl` whether it has a character in U+0000-U+001F or U+007F-U+009F.
+ */
+bool InspectUtf8(const std::string& text, std::size_t& outUnits, bool& outControl)
+{
+	outUnits = 0;
+	outControl = false;
+	std::size_t index = 0;
+	while (index < text.size())
+	{
+		const unsigned char lead = static_cast<unsigned char>(text[index]);
+		std::uint32_t codePoint = 0;
+		std::size_t length = 0;
+		if (lead < 0x80u)
+		{
+			codePoint = lead;
+			length = 1;
+		}
+		else if (lead >= 0xC2u && lead <= 0xDFu)
+		{
+			codePoint = lead & 0x1Fu;
+			length = 2;
+		}
+		else if (lead >= 0xE0u && lead <= 0xEFu)
+		{
+			codePoint = lead & 0x0Fu;
+			length = 3;
+		}
+		else if (lead >= 0xF0u && lead <= 0xF4u)
+		{
+			codePoint = lead & 0x07u;
+			length = 4;
+		}
+		else
+		{
+			return false;
+		}
+		if (text.size() - index < length)
+		{
+			return false;
+		}
+		for (std::size_t offset = 1; offset < length; ++offset)
+		{
+			const unsigned char next = static_cast<unsigned char>(text[index + offset]);
+			if ((next & 0xC0u) != 0x80u)
+			{
+				return false;
+			}
+			codePoint = (codePoint << 6) | (next & 0x3Fu);
+		}
+		if ((length == 3 && codePoint < 0x800u) || (length == 4 && codePoint < 0x10000u) ||
+			(codePoint >= 0xD800u && codePoint <= 0xDFFFu) || codePoint > 0x10FFFFu)
+		{
+			return false;
+		}
+		if (codePoint <= 0x1Fu || (codePoint >= 0x7Fu && codePoint <= 0x9Fu))
+		{
+			outControl = true;
+		}
+		// Counted explicitly: UTF-16 needs two code units above U+FFFF.
+		outUnits += codePoint >= 0x10000u ? 2u : 1u;
+		index += length;
+	}
+	return true;
+}
+
+/**
+ * Percent-decodes `text[begin, end)` like the campaign query: `+` is a space, `%XX` a byte, the
+ * bytes UTF-8. False for a malformed escape or bytes that are not UTF-8. Bytes that were not
+ * escaped stand for themselves.
+ */
+bool DecodeComponent(const std::string& text, std::size_t begin, std::size_t end, std::string& out)
+{
+	out.clear();
+	for (std::size_t i = begin; i < end; ++i)
+	{
+		const char c = text[i];
+		if (c == '%')
+		{
+			if (end - i < 3)
+			{
+				return false;
+			}
+			const int high = HexValue(text[i + 1]);
+			const int low = HexValue(text[i + 2]);
+			if (high < 0 || low < 0)
+			{
+				return false;
+			}
+			out.push_back(static_cast<char>(static_cast<unsigned char>(high * 16 + low)));
+			i += 2;
+		}
+		else
+		{
+			out.push_back(c == '+' ? ' ' : c);
+		}
+	}
+	std::size_t units = 0;
+	bool control = false;
+	return InspectUtf8(out, units, control);
+}
+
+/** The first occurrence of a query key. */
+struct QueryValue
+{
+	bool found = false;
+	/** False when the value could not be decoded. */
+	bool decoded = false;
+	/** Empty for a part without `=`. */
+	std::string value;
+};
+
+/**
+ * The first part of `rawQuery` (split on `&`, each part on its first `=`) whose decoded key is
+ * `key`, compared with case. A key that cannot be decoded is no key of ours.
+ */
+QueryValue FindFirst(const std::string& rawQuery, const std::string& key)
+{
+	QueryValue result;
+	std::string decodedKey;
+	std::size_t begin = 0;
+	while (begin <= rawQuery.size() && !rawQuery.empty())
+	{
+		std::size_t end = rawQuery.find('&', begin);
+		if (end == std::string::npos)
+		{
+			end = rawQuery.size();
+		}
+		// The first "=" of this part only: linear in the query, however many keys are looked up.
+		std::size_t equals = begin;
+		while (equals < end && rawQuery[equals] != '=')
+		{
+			++equals;
+		}
+		const bool hasValue = equals < end;
+		const std::size_t keyEnd = equals;
+		if (DecodeComponent(rawQuery, begin, keyEnd, decodedKey) && decodedKey == key)
+		{
+			result.found = true;
+			result.decoded = !hasValue || DecodeComponent(rawQuery, equals + 1, end, result.value);
+			if (!hasValue)
+			{
+				result.value.clear();
+			}
+			return result;
+		}
+		begin = end + 1;
+	}
+	return result;
+}
+
+/** 1-256 UTF-16 code units, none in U+0000-U+001F or U+007F-U+009F. */
+bool IsPayloadValue(const std::string& value)
+{
+	std::size_t units = 0;
+	bool control = false;
+	return InspectUtf8(value, units, control) && units >= 1 && units <= kMaxPayloadValueUnits && !control;
+}
+
+/**
+ * Appends `key=value` for each payload key, in the configured order, whose first occurrence in
+ * `rawQuery` has a usable value, each pair preceded by `?` when it is the first of the query and
+ * by `&` otherwise. Returns the number of pairs the query has now.
+ */
+std::size_t AppendPayloadQuery(
+	std::string& out, const std::string& rawQuery, const std::vector<std::string>& payloadKeys, std::size_t pairs)
+{
+	for (const std::string& key : payloadKeys)
+	{
+		// A later occurrence never counts, even when the first one is dropped.
+		const QueryValue first = FindFirst(rawQuery, key);
+		if (!first.found || !first.decoded || !IsPayloadValue(first.value))
+		{
+			continue;
+		}
+		out += pairs == 0 ? '?' : '&';
+		out += key;
+		out += '=';
+		out += PercentEncode(first.value);
+		++pairs;
+	}
+	return pairs;
+}
+
+/** The campaign pairs after `pairs` pairs already in the query. */
+void AppendCampaignQuery(std::string& out, const std::string& rawQuery, std::size_t pairs)
+{
+	const std::string campaign = BuildCampaignQuery(rawQuery); // "" or "?key=value&..."
+	if (campaign.empty())
+	{
+		return;
+	}
+	if (pairs == 0)
+	{
+		out += campaign;
+	}
+	else
+	{
+		out += '&';
+		out.append(campaign, 1, std::string::npos);
+	}
+}
+
+bool IsDeepLinkHostChar(char c)
+{
+	return IsAsciiAlnum(c) || c == '.' || c == '-' || c == '_';
+}
+
+/** `A-Z a-z 0-9 - . _ ~ ! $ & ' ( ) * + , ; = : @` and `/`. */
+bool IsRoutePathChar(char c)
+{
+	if (IsAsciiAlnum(c))
+	{
+		return true;
+	}
+	switch (c)
+	{
+	case '-':
+	case '.':
+	case '_':
+	case '~':
+	case '!':
+	case '$':
+	case '&':
+	case '\'':
+	case '(':
+	case ')':
+	case '*':
+	case '+':
+	case ',':
+	case ';':
+	case '=':
+	case ':':
+	case '@':
+	case '/':
+		return true;
+	default:
+		return false;
+	}
+}
+
+/** Whether `path[begin, end)` is `.` or `..`, each dot possibly written `%2e` or `%2E`. */
+bool IsDotSegment(const std::string& path, std::size_t begin, std::size_t end)
+{
+	std::size_t dots = 0;
+	std::size_t i = begin;
+	while (i < end)
+	{
+		if (path[i] == '.')
+		{
+			i += 1;
+		}
+		else if (path[i] == '%' && end - i >= 3 && path[i + 1] == '2' && (path[i + 2] == 'e' || path[i + 2] == 'E'))
+		{
+			i += 3;
+		}
+		else
+		{
+			return false;
+		}
+		++dots;
+	}
+	return dots == 1 || dots == 2;
+}
+
+bool IsReservedPath(const std::string& path)
+{
+	for (const char* prefix : kReservedPathPrefixes)
+	{
+		const std::string reserved(prefix);
+		if (path.compare(0, reserved.size(), reserved) == 0 &&
+			(path.size() == reserved.size() || path[reserved.size()] == '/'))
+		{
+			return true;
+		}
+	}
+	for (const char* file : kReservedPathFiles)
+	{
+		if (path == file)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * 1-512 characters starting with `/`; only route characters, every `%` followed by two
+ * hexadecimal digits (the path as received, never decoded); no `//`; no `.` or `..` segment; not
+ * reserved.
+ */
+bool IsRoutePath(const std::string& path)
+{
+	if (path.empty() || path.size() > kMaxRoutePathLength || path[0] != '/')
+	{
+		return false;
+	}
+	for (std::size_t i = 0; i < path.size(); ++i)
+	{
+		const char c = path[i];
+		if (c == '%')
+		{
+			if (path.size() - i < 3 || HexValue(path[i + 1]) < 0 || HexValue(path[i + 2]) < 0)
+			{
+				return false;
+			}
+		}
+		else if (!IsRoutePathChar(c))
+		{
+			return false;
+		}
+		if (c == '/' && i + 1 < path.size() && path[i + 1] == '/')
+		{
+			return false;
+		}
+	}
+	std::size_t segmentBegin = 1;
+	for (std::size_t i = 1; i <= path.size(); ++i)
+	{
+		if (i < path.size() && path[i] != '/')
+		{
+			continue;
+		}
+		if (IsDotSegment(path, segmentBegin, i))
+		{
+			return false;
+		}
+		segmentBegin = i + 1;
+	}
+	return !IsReservedPath(path);
+}
+
+/**
+ * For a deep link (`http(s)://host` and an optional path, query and fragment):
+ * `{lower-cased scheme}://{lower-cased host}{path}`, `/` for an empty path, followed by the payload
+ * query of its own query. Its fragment and the rest of its query are dropped. False when `value`
+ * is not a deep link: a character at or below U+0020, U+007F or `\`, another scheme, an empty host,
+ * or anything but a path, query or fragment after the host (a port, user info, an IP literal in
+ * brackets). A dotted IPv4 address passes; the server refuses it.
+ */
+bool RebuildDeepLink(const std::string& value, const std::vector<std::string>& payloadKeys, std::string& outDeep)
+{
+	for (char c : value)
+	{
+		const unsigned char byte = static_cast<unsigned char>(c);
+		if (byte <= 0x20u || byte == 0x7Fu || c == '\\')
+		{
+			return false;
+		}
+	}
+	std::string scheme;
+	if (StartsWithIgnoreCase(value, "https://"))
+	{
+		scheme = "https";
+	}
+	else if (StartsWithIgnoreCase(value, "http://"))
+	{
+		scheme = "http";
+	}
+	else
+	{
+		return false;
+	}
+
+	const std::size_t hostBegin = scheme.size() + 3;
+	std::size_t hostEnd = hostBegin;
+	while (hostEnd < value.size() && IsDeepLinkHostChar(value[hostEnd]))
+	{
+		++hostEnd;
+	}
+	if (hostEnd == hostBegin)
+	{
+		return false;
+	}
+	if (hostEnd < value.size() && value[hostEnd] != '/' && value[hostEnd] != '?' && value[hostEnd] != '#')
+	{
+		return false;
+	}
+
+	std::size_t pathEnd = value.find_first_of("?#", hostEnd);
+	if (pathEnd == std::string::npos)
+	{
+		pathEnd = value.size();
+	}
+	std::string query;
+	if (pathEnd < value.size() && value[pathEnd] == '?')
+	{
+		std::size_t queryEnd = value.find('#', pathEnd);
+		if (queryEnd == std::string::npos)
+		{
+			queryEnd = value.size();
+		}
+		query = value.substr(pathEnd + 1, queryEnd - pathEnd - 1);
+	}
+
+	outDeep = scheme + "://" + ToLowerAscii(value.substr(hostBegin, hostEnd - hostBegin));
+	outDeep += pathEnd == hostEnd ? std::string("/") : value.substr(hostEnd, pathEnd - hostEnd);
+	AppendPayloadQuery(outDeep, query, payloadKeys, 0);
+	return true;
+}
+
+/** `https://{host}{path}`, the payload query, then the campaign query. */
+std::string PathLookup(const OurUrl& parts, const std::string& path, const std::vector<std::string>& payloadKeys)
+{
+	std::string lookup = "https://" + parts.host + path;
+	const std::size_t pairs = AppendPayloadQuery(lookup, parts.rawQuery, payloadKeys, 0);
+	AppendCampaignQuery(lookup, parts.rawQuery, pairs);
+	return lookup;
+}
+
+/**
+ * `https://{host}/?link={deep}`, then `apn` and `ibi` when the tapped URL has them, then the
+ * campaign query. Nothing else of the tapped URL is sent.
+ */
+bool LongLinkLookup(
+	const OurUrl& parts, const QueryValue& link, const std::vector<std::string>& payloadKeys, std::string& outLookup)
+{
+	std::string deep;
+	if (!link.decoded || !RebuildDeepLink(link.value, payloadKeys, deep))
+	{
+		return false;
+	}
+	// Sent as they are, even empty: the server compares them with the app's identifiers and
+	// refuses a mismatch, as the link host does. One that cannot be decoded is not ours.
+	const QueryValue apn = FindFirst(parts.rawQuery, "apn");
+	const QueryValue ibi = FindFirst(parts.rawQuery, "ibi");
+	if ((apn.found && !apn.decoded) || (ibi.found && !ibi.decoded))
+	{
+		return false;
+	}
+	std::string lookup = "https://" + parts.host + "/?link=" + PercentEncode(deep);
+	if (apn.found)
+	{
+		lookup += "&apn=" + PercentEncode(apn.value);
+	}
+	if (ibi.found)
+	{
+		lookup += "&ibi=" + PercentEncode(ibi.value);
+	}
+	AppendCampaignQuery(lookup, parts.rawQuery, 1);
+	outLookup = lookup;
+	return true;
+}
+
+/** "Which URLs are ours, with the option" and "What is sent", in the order of the contract. */
+bool BuildParameterLinkLookup(const OurUrl& parts, const ParameterLinks& parameterLinks, std::string& outLookup)
+{
+	const std::vector<std::string>& payloadKeys = parameterLinks.payloadKeys;
+	// 1. A slug is ours, as without the option; the server answers it as a stored link or a path
+	//    link. (Checked first: "/_strybok" is a slug, although "/_strybok/x" is reserved.)
+	if (IsSlugPath(parts.path))
+	{
+		outLookup = PathLookup(parts, parts.path, payloadKeys);
+		return true;
+	}
+	// 2. An empty path is the root.
+	const std::string path = parts.path.empty() ? std::string("/") : parts.path;
+	// 3. A Firebase long link: the root with a `link` parameter. Ours only when the link is a deep
+	//    link; it is never read as a route instead.
+	if (path == "/")
+	{
+		const QueryValue link = FindFirst(parts.rawQuery, "link");
+		if (link.found)
+		{
+			return LongLinkLookup(parts, link, payloadKeys, outLookup);
+		}
+	}
+	// 4. A route path.
+	if (!IsRoutePath(path))
+	{
+		return false;
+	}
+	outLookup = PathLookup(parts, path, payloadKeys);
+	return true;
+}
+
+} // namespace
+
+std::string ValidateParameterLinks(const ParameterLinks& parameterLinks)
+{
+	const std::vector<std::string>& keys = parameterLinks.payloadKeys;
+	if (keys.size() > kMaxPayloadKeys)
+	{
+		return "parameterLinks: at most 20 payload keys are allowed";
+	}
+	for (std::size_t index = 0; index < keys.size(); ++index)
+	{
+		const std::string& key = keys[index];
+		bool shape = !key.empty() && key.size() <= kMaxPayloadKeyLength;
+		for (char c : key)
+		{
+			shape = shape && (IsAsciiAlnum(c) || c == '_' || c == '.' || c == '-');
+		}
+		if (!shape)
+		{
+			return "parameterLinks: a payload key must be 1-40 characters of A-Z a-z 0-9 _ . -";
+		}
+		if (StartsWithIgnoreCase(key, "utm_"))
+		{
+			return "parameterLinks: \"" + key + "\" cannot be a payload key: Strybok reads utm_ keys itself";
+		}
+		for (const char* reserved : kReservedPayloadKeys)
+		{
+			if (key == reserved)
+			{
+				return "parameterLinks: \"" + key + "\" is reserved and cannot be a payload key";
+			}
+		}
+		for (std::size_t other = 0; other < index; ++other)
+		{
+			if (keys[other] == key)
+			{
+				return "parameterLinks: \"" + key + "\" is listed twice";
+			}
+		}
+	}
+	return std::string();
+}
+
+bool BuildLookupUrl(
+	const std::string& url,
+	const std::vector<std::string>& normalizedHosts,
+	const ParameterLinks* parameterLinks,
+	std::string& outLookup)
+{
+	if (parameterLinks == nullptr)
+	{
+		return BuildLookupUrl(url, normalizedHosts, outLookup);
+	}
+	OurUrl parts;
+	return ParseOurUrl(url, normalizedHosts, true, parts) && BuildParameterLinkLookup(parts, *parameterLinks, outLookup);
 }
 
 std::string BuildResolveEndpoint(const std::string& apiBaseUrl, const std::string& lookupUrl)
@@ -1292,7 +1862,8 @@ bool FindClickIdInPastedLink(
 {
 	outClickId.clear();
 	OurUrl parts;
-	if (!ParseOurUrl(TrimAsciiSpace(text), normalizedHosts, parts))
+	// The slug rule, with or without `parameterLinks`: the copied link is a stored link's.
+	if (!ParseOurUrl(TrimAsciiSpace(text), normalizedHosts, false, parts))
 	{
 		return false;
 	}
@@ -1929,7 +2500,14 @@ public:
 	bool IsReady() const { return ready_; }
 	bool IsStopped() const { return stopped_; }
 	std::size_t PendingCount() const { return pending_.size(); }
-	bool IsOurs(const std::string& url) const { return strybok::IsStrybokUrl(url, hosts_); }
+	/** Links that arrive or are resolved; deferred links keep the slug rule (`ParseDeferredBody`). */
+	bool IsOurs(const std::string& url) const { return strybok::IsStrybokUrl(url, hosts_, OptionalParameterLinks()); }
+
+	/** The `parameterLinks` option, or null when it is not set. */
+	const ParameterLinks* OptionalParameterLinks() const
+	{
+		return config_.parameterLinks ? &*config_.parameterLinks : nullptr;
+	}
 
 	// --- lifecycle ---
 
@@ -2301,7 +2879,7 @@ private:
 	void StartResolve(const std::string& url, ResolveCallback done)
 	{
 		std::string lookup;
-		if (!BuildLookupUrl(url, hosts_, lookup))
+		if (!BuildLookupUrl(url, hosts_, OptionalParameterLinks(), lookup))
 		{
 			return;
 		}

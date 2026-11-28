@@ -24,6 +24,8 @@ FStrybokConfig UStrybokSettings::ToConfig() const
 	Config.DedupeWindowSeconds = DedupeWindowSeconds;
 	Config.bReportAppOpens = bReportAppOpens;
 	Config.ClientKey = ClientKey;
+	Config.bParameterLinks = bParameterLinks;
+	Config.PayloadKeys = PayloadKeys;
 	Config.bDeferredLinks = bDeferredLinks;
 	Config.bAllowProbabilisticMatching = bAllowProbabilisticMatching;
 	Config.AndroidPackageName = AndroidPackageName;

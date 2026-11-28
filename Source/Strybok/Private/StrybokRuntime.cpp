@@ -232,6 +232,20 @@ strybok::Config StrybokConvert::ToCoreConfig(const FStrybokConfig& Config)
 #endif
 	Result.sdkVersion = strybok::kSdkVersion;
 	Result.clientKey = ToStd(Config.ClientKey.TrimStartAndEnd());
+	if (Config.bParameterLinks)
+	{
+		// Trimmed, without blank entries (an editor list easily has one); ValidateConfig checks the rest.
+		strybok::ParameterLinks CoreParameterLinks;
+		for (const FString& Key : Config.PayloadKeys)
+		{
+			const FString Trimmed = Key.TrimStartAndEnd();
+			if (!Trimmed.IsEmpty())
+			{
+				CoreParameterLinks.payloadKeys.push_back(ToStd(Trimmed));
+			}
+		}
+		Result.parameterLinks = CoreParameterLinks;
+	}
 	Result.deferredLinks = Config.bDeferredLinks;
 	Result.allowProbabilisticMatching = Config.bAllowProbabilisticMatching;
 	Result.androidPackageName = ToStd(Config.AndroidPackageName.TrimStartAndEnd());

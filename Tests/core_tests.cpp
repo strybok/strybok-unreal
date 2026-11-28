@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -397,6 +398,9 @@ struct Options
 	std::int64_t retryDelayMs = 1;
 	bool reportAppOpens = true;
 	std::string apiBaseUrl = kApi;
+	std::vector<std::string> allowedHosts = {kHost};
+	/** Unset: the option is not set, as in every test before links without an API call. */
+	std::optional<ParameterLinks> parameterLinks;
 };
 
 /** The Dart tests' `bridge(...)`: an engine wired to fakes, recording links and errors. */
@@ -412,7 +416,8 @@ struct Bridge
 	{
 		Config config;
 		config.apiBaseUrl = options.apiBaseUrl;
-		config.allowedHosts = {kHost};
+		config.allowedHosts = options.allowedHosts;
+		config.parameterLinks = options.parameterLinks;
 		config.timeoutMs = options.timeoutMs;
 		config.maxRetries = options.maxRetries;
 		config.retryDelayMs = options.retryDelayMs;
@@ -1527,7 +1532,7 @@ TEST(Events, SendsOneMinimalBestEffortEventPerDeliveredLink) // [ref]
 	EXPECT_EQ(StringMember(event, "type"), "app_open");
 	EXPECT_EQ(StringMember(event, "linkId"), "link_1");
 	EXPECT_EQ(StringMember(event, "platform"), "ios");
-	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.3.0");
+	EXPECT_EQ(StringMember(event, "sdkVersion"), "0.4.0");
 	EXPECT_MSG(IsUuidV4(StringMember(event, "eventId")), StringMember(event, "eventId"));
 }
 
@@ -1632,7 +1637,7 @@ TEST(Events, BodyIsExactAndEscapedAndTheVersionIsCapped)
 
 	EXPECT(json::Parse(BuildAppOpenBody("id", "l", "ios", ""), event));
 	EXPECT_EQ(StringMember(event, "sdkVersion"), std::string(kSdkVersion));
-	EXPECT_EQ(std::string(kSdkVersion), "0.3.0");
+	EXPECT_EQ(std::string(kSdkVersion), "0.4.0");
 }
 
 TEST(Events, AnInjectedRandomSourceIsUsed)
@@ -4802,6 +4807,483 @@ TEST(DeferredMatching, OnlyOneOfTheTwoFlowsDelivers)
 	EXPECT(m.api.Complete(m.api.deferredIds[0], Respond(200, DeferredBody())));
 	EXPECT_EQ(m.pasted.back(), PastedLinkResult::AlreadyHandled);
 	EXPECT_EQ(m.received.size(), Count(1));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Links without an API call (SDK contract; decision 0035): the shared test vectors in
+// Tests/Fixtures, read with the core's own JSON reader, and the behaviour around them.
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+/** The copy of the shared vectors next to this file (the runner compiles it by its absolute path). */
+std::string VectorsPath()
+{
+	const std::string here = __FILE__;
+	const std::size_t slash = here.find_last_of("/\\");
+	const std::string folder = slash == std::string::npos ? std::string(".") : here.substr(0, slash);
+	return folder + "/Fixtures/parameter-links-vectors.json";
+}
+
+/** The parsed vectors file; `Null` when it could not be read. */
+const json::Value& VectorsFile()
+{
+	static json::Value root;
+	static bool loaded = false;
+	if (!loaded)
+	{
+		loaded = true;
+		std::string text;
+		if (std::FILE* file = std::fopen(VectorsPath().c_str(), "rb"))
+		{
+			char buffer[4096];
+			std::size_t count = 0;
+			while ((count = std::fread(buffer, 1, sizeof(buffer), file)) > 0)
+			{
+				text.append(buffer, count);
+			}
+			std::fclose(file);
+		}
+		if (!json::Parse(text, root) || root.type != json::Type::Object)
+		{
+			root = json::Value();
+		}
+	}
+	return root;
+}
+
+std::vector<std::string> StringItems(const json::Value* list)
+{
+	std::vector<std::string> items;
+	if (list != nullptr && list->type == json::Type::Array)
+	{
+		for (const json::Value& item : list->items)
+		{
+			items.push_back(item.text);
+		}
+	}
+	return items;
+}
+
+const json::Value* VectorList(const char* name)
+{
+	const json::Value* list = VectorsFile().Find(name);
+	return list != nullptr && list->type == json::Type::Array ? list : nullptr;
+}
+
+/** The `parameterLinks` of a case; unset for `null`. */
+std::optional<ParameterLinks> OptionOf(const json::Value& entry)
+{
+	const json::Value* option = entry.Find("parameterLinks");
+	if (option == nullptr || option->type != json::Type::Object)
+	{
+		return std::nullopt;
+	}
+	ParameterLinks parameterLinks;
+	parameterLinks.payloadKeys = StringItems(option->Find("payloadKeys"));
+	return parameterLinks;
+}
+
+const ParameterLinks* PointerOf(const std::optional<ParameterLinks>& parameterLinks)
+{
+	return parameterLinks ? &*parameterLinks : nullptr;
+}
+
+/** A bridge on the hosts of the vectors file with this option. */
+Options VectorOptions(const std::optional<ParameterLinks>& parameterLinks)
+{
+	Options options;
+	options.allowedHosts = StringItems(VectorsFile().Find("allowedHosts"));
+	options.parameterLinks = parameterLinks;
+	return options;
+}
+
+/** What resolve is asked for `lookup`, encoded as the SDK encodes `url`. */
+std::string ResolveUrlOf(const std::string& lookup)
+{
+	return kResolvePrefix + PercentEncode(lookup);
+}
+
+const std::string kPathBase = "https://my-app.strybok.link/p";
+
+/** The lookup of `url` on `my-app.strybok.link` with these keys; `<not ours>` when it is not ours. */
+std::string LookupWith(const std::vector<std::string>& payloadKeys, const std::string& url)
+{
+	ParameterLinks parameterLinks;
+	parameterLinks.payloadKeys = payloadKeys;
+	std::string lookup;
+	return BuildLookupUrl(url, Hosts(), &parameterLinks, lookup) ? lookup : std::string("<not ours>");
+}
+
+} // namespace
+
+TEST(ParameterLinks, TheVectorsFileHasCasesOfBothKinds)
+{
+	EXPECT_MSG(VectorsFile().type == json::Type::Object, VectorsPath());
+	const std::vector<std::string> hosts = StringItems(VectorsFile().Find("allowedHosts"));
+	EXPECT_EQ(hosts.size(), Count(2));
+	EXPECT(VectorList("lookups") != nullptr && !VectorList("lookups")->items.empty());
+	EXPECT(VectorList("configurations") != nullptr && !VectorList("configurations")->items.empty());
+}
+
+TEST(ParameterLinks, EveryLookupVector)
+{
+	const json::Value* lookups = VectorList("lookups");
+	EXPECT(lookups != nullptr);
+	if (lookups == nullptr)
+	{
+		return;
+	}
+	const std::vector<std::string> hosts = NormalizeHosts(StringItems(VectorsFile().Find("allowedHosts")));
+	std::size_t ran = 0;
+	for (const json::Value& entry : lookups->items)
+	{
+		const std::string name = StringMember(entry, "name");
+		const std::string url = StringMember(entry, "url");
+		const json::Value* expectedValue = entry.Find("lookup");
+		const bool ours = expectedValue != nullptr && expectedValue->type == json::Type::String;
+		const std::string expected = ours ? expectedValue->text : std::string();
+		const std::optional<ParameterLinks> option = OptionOf(entry);
+
+		// The rules themselves.
+		std::string lookup;
+		EXPECT_MSG(BuildLookupUrl(url, hosts, PointerOf(option), lookup) == ours, name);
+		if (ours)
+		{
+			EXPECT_MSG(lookup == expected, name + ": sent " + lookup);
+		}
+		EXPECT_MSG(IsStrybokUrl(url, hosts, PointerOf(option)) == ours, name);
+
+		// Resolve(url).
+		{
+			Bridge b(VectorOptions(option));
+			EXPECT_MSG(b.sdk->IsStrybokUrl(url) == ours, name);
+			const Bridge::ResolveOutcome outcome = b.Resolve(url);
+			EXPECT_MSG(outcome.called, name);
+			if (ours)
+			{
+				EXPECT_MSG(outcome.ok, name);
+				EXPECT_MSG(b.api.resolves.size() == 1 && b.api.resolves[0].url == ResolveUrlOf(expected), name);
+				EXPECT_MSG(outcome.link.uri == url, name);
+			}
+			else
+			{
+				EXPECT_MSG(!outcome.ok && outcome.error.kind == ErrorKind::UnsupportedLink, name);
+				EXPECT_MSG(b.api.resolves.empty(), name);
+			}
+		}
+
+		// The automatic flow.
+		{
+			Bridge b(VectorOptions(option));
+			b.Listen();
+			EXPECT_MSG(b.Initialize(), name);
+			b.sdk->HandleUrl(url);
+			b.loop.Settle();
+			EXPECT_MSG(b.errors.empty(), name);
+			if (ours)
+			{
+				EXPECT_MSG(b.api.resolves.size() == 1 && b.api.resolves[0].url == ResolveUrlOf(expected), name);
+				EXPECT_MSG(b.received.size() == 1, name);
+			}
+			else
+			{
+				EXPECT_MSG(b.api.resolves.empty(), "dropped without a request: " + name);
+				EXPECT_MSG(b.received.empty(), name);
+			}
+		}
+		++ran;
+	}
+	EXPECT_EQ(ran, lookups->items.size());
+}
+
+TEST(ParameterLinks, EveryConfigurationVector)
+{
+	const json::Value* configurations = VectorList("configurations");
+	EXPECT(configurations != nullptr);
+	if (configurations == nullptr)
+	{
+		return;
+	}
+	for (const json::Value& entry : configurations->items)
+	{
+		const std::string name = StringMember(entry, "name");
+		const json::Value* validValue = entry.Find("valid");
+		const bool valid = validValue != nullptr && validValue->type == json::Type::Bool && validValue->boolean;
+		// Rejected the way an invalid apiBaseUrl is: by ValidateConfig, which Configure checks.
+		Config config;
+		config.apiBaseUrl = kApi;
+		config.allowedHosts = {kHost};
+		config.parameterLinks = OptionOf(entry);
+		const std::string problem = ValidateConfig(config);
+		EXPECT_MSG(problem.empty() == valid, name + ": " + problem);
+		if (config.parameterLinks)
+		{
+			EXPECT_MSG(ValidateParameterLinks(*config.parameterLinks) == problem, name);
+		}
+		if (!valid)
+		{
+			EXPECT_MSG(problem.compare(0, 16, "parameterLinks: ") == 0, name + ": " + problem);
+		}
+	}
+}
+
+TEST(ParameterLinks, TheOptionIsAbsentByDefault)
+{
+	EXPECT(!Config().parameterLinks.has_value());
+	// Without it the rules are those of 0.3.0, URL by URL.
+	const json::Value* lookups = VectorList("lookups");
+	const std::vector<std::string> hosts = NormalizeHosts(StringItems(VectorsFile().Find("allowedHosts")));
+	for (const json::Value& entry : lookups != nullptr ? lookups->items : std::vector<json::Value>())
+	{
+		const std::string url = StringMember(entry, "url");
+		std::string plain;
+		std::string unset;
+		const bool ours = BuildLookupUrl(url, hosts, plain);
+		EXPECT_MSG(BuildLookupUrl(url, hosts, nullptr, unset) == ours, url);
+		EXPECT_MSG(plain == unset, url);
+		EXPECT_MSG(IsStrybokUrl(url, hosts, nullptr) == IsStrybokUrl(url, hosts), url);
+	}
+}
+
+TEST(ParameterLinks, PayloadValuesAreCountedInUtf16CodeUnits)
+{
+	// U+1F600 is 4 bytes of UTF-8 and 2 UTF-16 code units; "é" is 2 bytes and 1 code unit.
+	std::string emoji128;
+	for (int index = 0; index < 128; ++index)
+	{
+		emoji128 += "%F0%9F%98%80";
+	}
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + emoji128), kPathBase + "?id=" + emoji128);
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + emoji128 + "%F0%9F%98%80"), kPathBase);
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + std::string(254, 'a') + "%F0%9F%98%80"),
+		kPathBase + "?id=" + std::string(254, 'a') + "%F0%9F%98%80");
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + std::string(255, 'a') + "%F0%9F%98%80"), kPathBase);
+
+	std::string accented256;
+	for (int index = 0; index < 256; ++index)
+	{
+		accented256 += "%C3%A9";
+	}
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + accented256), kPathBase + "?id=" + accented256);
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=" + accented256 + "%C3%A9"), kPathBase);
+}
+
+TEST(ParameterLinks, ValuesThatAreNotUtf8OrAreControlCharactersAreDropped)
+{
+	for (const char* value : {"%C0%AF", "%E0%80%AF", "%ED%A0%80", "%F4%90%80%80", "%F5%80%80%80", "%80", "%C3", "%E2%82",
+			 "%FF", "%C3%28", "%C2%80", "%C2%9F", "%7F", "%00", "\xFF", "%"})
+	{
+		EXPECT_MSG(LookupWith({"id", "lang"}, kPathBase + "?id=" + value + "&lang=uk") == kPathBase + "?lang=uk", value);
+	}
+	// U+00A0 is no control character; raw UTF-8 in the query stands for itself.
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=%C2%A0"), kPathBase + "?id=%C2%A0");
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=caf\xC3\xA9"), kPathBase + "?id=caf%C3%A9");
+	EXPECT_EQ(LookupWith({"id"}, kPathBase + "?id=%F0%9F%98%80"), kPathBase + "?id=%F0%9F%98%80");
+}
+
+TEST(ParameterLinks, AKeyWithoutAValueInALongLink)
+{
+	// "link" without "=" is a long link whose deep link is empty: not ours.
+	EXPECT_EQ(LookupWith({"id"}, "https://my-app.strybok.link/?link"), "<not ours>");
+	EXPECT_EQ(LookupWith({"id"}, "https://my-app.strybok.link/?link&id=7"), "<not ours>");
+	// "apn" and "ibi" without "=" are sent empty, as with "=", so the server refuses them as the
+	// link host does.
+	EXPECT_EQ(LookupWith({"id"}, "https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp&apn&ibi"),
+		"https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp&apn=&ibi=");
+	// The top-level payload keys of a long link are never sent; those of the deep link are.
+	EXPECT_EQ(LookupWith({"id"}, "https://my-app.strybok.link/?id=1&link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D2"),
+		"https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D2");
+}
+
+TEST(ParameterLinks, TheRouteAndPayloadComeFromTheAnswerNotFromTheTappedUrl)
+{
+	Options options;
+	options.parameterLinks = ParameterLinks{{"id", "lang"}};
+	Bridge b(options);
+	b.api.onResolve = [](const HttpRequest&) {
+		return Respond(200,
+			"{\"linkId\":\"plink_path\",\"appId\":\"app_1\",\"routePath\":\"/catalog/item\","
+			"\"payload\":{\"id\":\"from-server\"},\"campaign\":{\"source\":\"mail\"}}");
+	};
+	b.Listen();
+	EXPECT(b.Initialize());
+	const std::string tapped = "https://my-app.strybok.link/product/42?id=7&utm_source=x#top";
+	b.sdk->HandleUrl(tapped);
+	b.loop.Settle();
+
+	EXPECT_EQ(b.received.size(), Count(1));
+	if (b.received.size() == 1)
+	{
+		EXPECT_EQ(b.received[0].uri, tapped);
+		EXPECT_EQ(b.received[0].routePath, "/catalog/item"); // never the tapped path
+		EXPECT_EQ(b.received[0].payloadJson, "{\"id\":\"from-server\"}");
+		EXPECT_EQ(b.received[0].linkId, "plink_path");
+		EXPECT_EQ(b.received[0].campaign.source, "mail");
+		EXPECT(!b.received[0].isDeferred);
+	}
+	EXPECT_EQ(b.api.resolves.size(), Count(1));
+	if (b.api.resolves.size() == 1)
+	{
+		EXPECT_EQ(b.api.resolves[0].url, ResolveUrlOf("https://my-app.strybok.link/product/42?id=7&utm_source=x"));
+	}
+
+	// The same through Resolve, for a long link.
+	const Bridge::ResolveOutcome outcome =
+		b.Resolve("https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7&apn=com.example.app");
+	EXPECT(outcome.ok);
+	EXPECT_EQ(outcome.link.routePath, "/catalog/item");
+	EXPECT_EQ(outcome.link.payloadJson, "{\"id\":\"from-server\"}");
+}
+
+TEST(ParameterLinks, AppOpenCarriesTheLinkIdOfTheAnswer)
+{
+	Options options;
+	options.parameterLinks = ParameterLinks{{"id"}};
+	Bridge b(options);
+	b.api.onResolve = [](const HttpRequest&) {
+		return Respond(200, "{\"linkId\":\"plink_firebase\",\"appId\":\"app_1\",\"routePath\":\"/p\",\"payload\":{}}");
+	};
+	b.Listen();
+	EXPECT(b.Initialize());
+	b.sdk->HandleUrl("https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp");
+	b.loop.Settle();
+
+	EXPECT_EQ(b.api.events.size(), Count(1));
+	if (b.api.events.size() == 1)
+	{
+		json::Value event;
+		EXPECT(json::Parse(b.api.events[0].body, event));
+		EXPECT_EQ(StringMember(event, "linkId"), "plink_firebase");
+		EXPECT_EQ(StringMember(event, "type"), "app_open");
+		EXPECT_EQ(StringMember(event, "sdkVersion"), "0.4.0");
+		EXPECT(event.Find("campaign") == nullptr);
+	}
+}
+
+TEST(ParameterLinks, AnAddressThatIsNoLinkIsLinkNotFound)
+{
+	Options options;
+	options.parameterLinks = ParameterLinks{};
+	Bridge b(options);
+	b.api.onResolve = [](const HttpRequest&) { return Respond(404); };
+	b.Listen();
+	EXPECT(b.Initialize());
+	b.sdk->HandleUrl("https://my-app.strybok.link/no/such/route");
+	b.loop.Settle();
+
+	EXPECT_EQ(b.errors.size(), Count(1));
+	if (b.errors.size() == 1)
+	{
+		EXPECT_EQ(b.errors[0].kind, ErrorKind::LinkNotFound);
+		EXPECT_EQ(b.errors[0].url, "https://my-app.strybok.link/no/such/route");
+	}
+	EXPECT(b.received.empty());
+	EXPECT_EQ(b.api.resolves.size(), Count(1)); // a 404 is not retried
+}
+
+TEST(ParameterLinks, DedupeComparesTheFullUrlAsReceived)
+{
+	Options options;
+	options.parameterLinks = ParameterLinks{{"id"}};
+	Bridge b(options);
+	b.Listen();
+	EXPECT(b.Initialize());
+	b.sdk->HandleUrl("https://my-app.strybok.link/product/42?id=7");
+	b.sdk->HandleUrl("https://my-app.strybok.link/product/42?id=7"); // one tap reported twice
+	b.sdk->HandleUrl("https://my-app.strybok.link/product/42?id=7&ref=x"); // another URL, the same lookup
+	b.loop.Settle();
+
+	EXPECT_EQ(b.received.size(), Count(2));
+	EXPECT_EQ(b.api.resolves.size(), Count(2));
+	for (const HttpRequest& request : b.api.resolves)
+	{
+		EXPECT_EQ(request.url, ResolveUrlOf("https://my-app.strybok.link/product/42?id=7"));
+	}
+}
+
+TEST(ParameterLinks, DeferredAnswersKeepTheSlugRule)
+{
+	for (const char* url : {"https://my-app.strybok.link/product/42", "https://my-app.strybok.link/",
+			 "https://my-app.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp"})
+	{
+		ResolvedLink parsed;
+		EXPECT_MSG(!ParseDeferredBody(DeferredBody(url), Hosts(), false, parsed), url);
+
+		Deferred d("android");
+		d.config.parameterLinks = ParameterLinks{{"id", "lang"}};
+		d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+		const std::string body = DeferredBody(url);
+		d.api.onDeferred = [body](const HttpRequest&) { return Respond(200, body); };
+		d.Listen();
+		EXPECT(d.Start());
+		d.loop.Settle();
+		EXPECT_EQ(d.Status(), DeferredLinkStatus::Failed);
+		EXPECT_MSG(d.received.empty(), url);
+		EXPECT_EQ(d.api.deferred.size(), Count(1));
+		EXPECT(d.store->Done());
+	}
+
+	// The same answer with a slug is delivered, with the option set as well.
+	Deferred d("android");
+	d.config.parameterLinks = ParameterLinks{{"id", "lang"}};
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody("https://my-app.strybok.link/Ab3xK9")); };
+	d.Listen();
+	EXPECT(d.Start());
+	d.loop.Settle();
+	EXPECT_EQ(d.received.size(), Count(1));
+	if (d.received.size() == 1)
+	{
+		EXPECT(d.received[0].isDeferred);
+	}
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Delivered);
+}
+
+TEST(ParameterLinks, APastedPathLinkIsNotOurs)
+{
+	// The page before the App Store copies a stored link's URL; a path link never has a click id.
+	Deferred d("ios");
+	d.config.parameterLinks = ParameterLinks{{"id"}};
+	d.Listen();
+	EXPECT(d.Start());
+	d.Paste("https://my-app.strybok.link/product/42?strybok_click=" + kClick);
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.size(), Count(1));
+	if (d.pasted.size() == 1)
+	{
+		EXPECT_EQ(d.pasted[0], PastedLinkResult::NotOurs);
+	}
+	EXPECT(d.api.deferred.empty());
+
+	d.Paste(kPasted);
+	d.loop.Settle();
+	EXPECT_EQ(d.pasted.size(), Count(2));
+	if (d.pasted.size() == 2)
+	{
+		EXPECT_EQ(d.pasted[1], PastedLinkResult::NotFound);
+	}
+	EXPECT_EQ(d.api.deferred.size(), Count(1));
+}
+
+TEST(ParameterLinks, APathLinkTappedFirstSupersedesTheDeferredLink)
+{
+	// A path link is a normal link of this app: the deferred link is dropped (one launch, one navigation).
+	Deferred d("android");
+	d.config.parameterLinks = ParameterLinks{{"id"}};
+	d.config.installReferrerSources = {Answering(Referrer("strybok_click=" + kClick))};
+	d.api.onDeferred = [](const HttpRequest&) { return Respond(200, DeferredBody()); };
+	d.Listen();
+	EXPECT(d.Start("https://my-app.strybok.link/product/42?id=7"));
+	d.loop.Settle();
+	EXPECT_EQ(d.Status(), DeferredLinkStatus::Superseded);
+	EXPECT(d.api.deferred.empty()); // no request is made
+	EXPECT_EQ(d.received.size(), Count(1));
+	if (d.received.size() == 1)
+	{
+		EXPECT(!d.received[0].isDeferred);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -216,6 +217,21 @@ public:
 extern const char* const kDeferredAttemptsKey;
 extern const char* const kDeferredDoneKey;
 
+/**
+ * The `parameterLinks` option (SDK contract, "Links without an API call"): `parameterLinks` of the
+ * integration guide, `GET /v1/apps/:appId/integration`, shown on the dashboard's setup screen.
+ */
+struct ParameterLinks
+{
+	/**
+	 * The query keys whose values are sent with a path link and become its payload, in the owner's
+	 * order. At most 20 distinct keys of 1-40 characters of `A-Z a-z 0-9 _ . -`; not `utm_...` (in
+	 * any case), `st`, `sd`, `si` or `strybok_click`. Empty is valid: path links then carry no
+	 * payload. The keys are compiled into the game; never configure one that carries personal data.
+	 */
+	std::vector<std::string> payloadKeys;
+};
+
 struct Config
 {
 	/** Base URL of the API, e.g. `https://api.strybok.com`. A path prefix is preserved. */
@@ -241,6 +257,14 @@ struct Config
 	 * secret. Never put a secret API key (`lb_...`) here.
 	 */
 	std::string clientKey;
+	/**
+	 * Links without an API call: deliver path links (`https://<host>/product/42?id=7`) and Firebase
+	 * long links (`https://<host>/?link=...`) and send the values of these payload keys with them.
+	 * Absent by default: then only links with a single slug path are ours, exactly as in 0.3.0.
+	 * `ValidateConfig` rejects an invalid one. The route and payload of a delivered link are the
+	 * server's answer, never the tapped path; deferred links keep the slug rule.
+	 */
+	std::optional<ParameterLinks> parameterLinks;
 
 	// --- deferred links (optional). Effective only with `deferredLinks`, a store, and platform
 	// `android` with `androidPackageName` or platform `ios` with `iosBundleId`; otherwise the
@@ -373,11 +397,30 @@ std::vector<std::string> NormalizeHosts(const std::vector<std::string>& hosts);
 std::string ValidateConfig(const Config& config);
 
 /**
+ * Empty when `parameterLinks` is a valid option, otherwise what is wrong with it: more than 20
+ * keys, a key twice, or a key that is not 1-40 characters of `A-Z a-z 0-9 _ . -`, starts with
+ * `utm_` in any case, or is `st`, `sd`, `si` or `strybok_click` (compared exactly).
+ */
+std::string ValidateParameterLinks(const ParameterLinks& parameterLinks);
+
+/**
  * Whether `url` is a Strybok link of this app: `https`, host in `normalizedHosts`, no user info,
  * no port or port 443, and a path matching `^/[A-Za-z0-9_-]{1,64}$`. Query and fragment are
  * allowed and do not decide anything. `normalizedHosts` must come from `NormalizeHosts`.
+ *
+ * This is the rule without the `parameterLinks` option, and the rule for deferred links whatever
+ * the option says: the server offers them only for stored links.
  */
 bool IsStrybokUrl(const std::string& url, const std::vector<std::string>& normalizedHosts);
+
+/**
+ * `IsStrybokUrl` with the `parameterLinks` option (SDK contract, "Which URLs are ours, with the
+ * option"): besides a slug, a route path and a Firebase long link are ours, and an empty path is
+ * read as `/`. The URL is checked as received; its path is never decoded or normalised.
+ * `parameterLinks` must have passed `ValidateParameterLinks`; null means the option is not set.
+ */
+bool IsStrybokUrl(
+	const std::string& url, const std::vector<std::string>& normalizedHosts, const ParameterLinks* parameterLinks);
 
 /**
  * The campaign query of a lookup URL (SDK contract, "Campaign query"): empty, or `?` followed by
@@ -396,6 +439,21 @@ std::string BuildCampaignQuery(const std::string& rawQuery);
  * part of the result: they may hold private data.
  */
 bool BuildLookupUrl(const std::string& url, const std::vector<std::string>& normalizedHosts, std::string& outLookup);
+
+/**
+ * The lookup with the `parameterLinks` option (SDK contract, "What is sent"); null means the
+ * option is not set, which is the overload above. For a slug or a route path:
+ * `https://{lower-cased host}{path}`, then the first value of each payload key that is 1-256 UTF-16
+ * code units without control characters, then the campaign query. For a Firebase long link:
+ * `https://{lower-cased host}/?link={deep}` with the deep link rebuilt from its scheme, host and
+ * path plus its own payload keys, then `apn` and `ibi` when the URL has them, then the campaign
+ * query. Values are percent-encoded byte by byte (`PercentEncode`). Nothing else is sent.
+ */
+bool BuildLookupUrl(
+	const std::string& url,
+	const std::vector<std::string>& normalizedHosts,
+	const ParameterLinks* parameterLinks,
+	std::string& outLookup);
 
 /** Percent-encodes everything except RFC 3986 unreserved characters. */
 std::string PercentEncode(const std::string& value);
@@ -468,8 +526,9 @@ std::string BuildDeferredMatchEndpoint(const std::string& apiBaseUrl);
 bool FindClickIdInReferrer(const std::string& referrer, std::string& outClickId);
 
 /**
- * The click id of a pasted link: `text`, trimmed, must be a link of this app (`IsStrybokUrl`) and
- * the first `strybok_click` parameter of its query must match `^dc_[0-9A-Za-z]{32}$`.
+ * The click id of a pasted link: `text`, trimmed, must be a link of this app (`IsStrybokUrl`, the
+ * slug rule with or without `parameterLinks`: the copied link is a stored link's) and the first
+ * `strybok_click` parameter of its query must match `^dc_[0-9A-Za-z]{32}$`.
  */
 bool FindClickIdInPastedLink(
 	const std::string& text, const std::vector<std::string>& normalizedHosts, std::string& outClickId);
@@ -497,8 +556,8 @@ bool IsMatchLocale(const std::string& value);
 
 /**
  * Validates a 200 answer of the redeem or match endpoint: everything `ParseResolveBody` checks,
- * `deferred` is `true`, `url` is a link of this app and, with `requireProbabilistic`, `matched`
- * is `"probabilistic"`. Fills `outLink` with `uri` = the answer's `url`, `isDeferred` = true and
+ * `deferred` is `true`, `url` is a link of this app (the slug rule, with or without
+ * `parameterLinks`) and, with `requireProbabilistic`, `matched` is `"probabilistic"`. Fills `outLink` with `uri` = the answer's `url`, `isDeferred` = true and
  * `isProbabilisticMatch` = `requireProbabilistic`.
  */
 bool ParseDeferredBody(

@@ -1,0 +1,890 @@
+{
+  "description": "Shared test vectors of the Strybok SDK contract, section \"Links without an API call\". Every SDK keeps a byte-identical copy of this file next to its tests and runs every case. Each lookup case gives the SDK allowedHosts (above), the parameterLinks option (null: the option is not set) and the tapped url; lookup is the exact URL the SDK puts into the url parameter of resolve (before that parameter is percent-encoded), or null when the URL is not ours: the automatic flow drops it without a request and resolve() fails with UnsupportedLink. Each configuration case says whether an SDK accepts that parameterLinks option; an invalid one is a configuration error.",
+  "allowedHosts": ["myapp.strybok.link", "go.example.com"],
+  "lookups": [
+    {
+      "name": "off: a slug keeps only valid utm_* values (the example of \"Campaign query\")",
+      "parameterLinks": null,
+      "url": "https://MyApp.strybok.link/invite777?utm_source=instagram&fbclid=abc&utm_medium=two%20words&utm_source=x#top",
+      "lookup": "https://myapp.strybok.link/invite777?utm_source=instagram"
+    },
+    {
+      "name": "off: a slug never sends other query parameters",
+      "parameterLinks": null,
+      "url": "https://myapp.strybok.link/promo?id=7",
+      "lookup": "https://myapp.strybok.link/promo"
+    },
+    {
+      "name": "off: a path of several segments is not ours",
+      "parameterLinks": null,
+      "url": "https://myapp.strybok.link/product/42?id=7",
+      "lookup": null
+    },
+    {
+      "name": "off: a Firebase long link is not ours",
+      "parameterLinks": null,
+      "url": "https://myapp.strybok.link/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3D7",
+      "lookup": null
+    },
+    {
+      "name": "off: the root is not ours",
+      "parameterLinks": null,
+      "url": "https://myapp.strybok.link/",
+      "lookup": null
+    },
+    {
+      "name": "off: an empty path is not ours",
+      "parameterLinks": null,
+      "url": "https://myapp.strybok.link?id=7",
+      "lookup": null
+    },
+    {
+      "name": "path: only the payload keys are sent",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/product/42?id=7&ref=x",
+      "lookup": "https://myapp.strybok.link/product/42?id=7"
+    },
+    {
+      "name": "path: payload keys in the configured order, then utm_* in the fixed order",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/product/42?utm_source=newsletter&lang=uk&id=7&utm_campaign=black-friday",
+      "lookup": "https://myapp.strybok.link/product/42?id=7&lang=uk&utm_source=newsletter&utm_campaign=black-friday"
+    },
+    {
+      "name": "path: the fragment is never sent",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/product/42?id=7#reviews",
+      "lookup": "https://myapp.strybok.link/product/42?id=7"
+    },
+    {
+      "name": "path: without a query",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/product/42",
+      "lookup": "https://go.example.com/product/42"
+    },
+    {
+      "name": "path: the host is lower-cased, the path keeps its case",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://Go.Example.COM/Product/42?id=7",
+      "lookup": "https://go.example.com/Product/42?id=7"
+    },
+    {
+      "name": "path: \"+\" is a space; values are re-encoded strictly",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/search?id=a+b%2Bc%20d",
+      "lookup": "https://myapp.strybok.link/search?id=a%20b%2Bc%20d"
+    },
+    {
+      "name": "path: UTF-8 values",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/city?id=%D0%BA%D0%B8%D1%97%D0%B2",
+      "lookup": "https://myapp.strybok.link/city?id=%D0%BA%D0%B8%D1%97%D0%B2"
+    },
+    {
+      "name": "path: reserved characters in values are encoded",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=a%26b%3Dc%2Fd%3F%23",
+      "lookup": "https://myapp.strybok.link/p/1?id=a%26b%3Dc%2Fd%3F%23"
+    },
+    {
+      "name": "path: sub-delimiters in values are encoded",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=it's(1)!*",
+      "lookup": "https://myapp.strybok.link/p/1?id=it%27s%281%29%21%2A"
+    },
+    {
+      "name": "path: the first occurrence of a key counts",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=1&id=2",
+      "lookup": "https://myapp.strybok.link/p/1?id=1"
+    },
+    {
+      "name": "path: a first occurrence that cannot be decoded drops the key",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=%E0%A4&id=2",
+      "lookup": "https://myapp.strybok.link/p/1"
+    },
+    {
+      "name": "path: empty values and keys without \"=\" are dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=&lang",
+      "lookup": "https://myapp.strybok.link/p/1"
+    },
+    {
+      "name": "path: a value with a control character is dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=a%0Ab&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk"
+    },
+    {
+      "name": "path: 256 characters are kept, 257 dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&lang=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "lookup": "https://myapp.strybok.link/p/1?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "path: keys are compared after decoding",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?i%64=7",
+      "lookup": "https://myapp.strybok.link/p/1?id=7"
+    },
+    {
+      "name": "path: keys are compared with case",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?ID=7",
+      "lookup": "https://myapp.strybok.link/p/1"
+    },
+    {
+      "name": "path: the order of the configuration, not of the URL",
+      "parameterLinks": {
+        "payloadKeys": ["lang", "id"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=7&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk&id=7"
+    },
+    {
+      "name": "path: no payload keys configured: utm_* only",
+      "parameterLinks": {
+        "payloadKeys": []
+      },
+      "url": "https://myapp.strybok.link/product/42?id=7&utm_source=x",
+      "lookup": "https://myapp.strybok.link/product/42?utm_source=x"
+    },
+    {
+      "name": "path: a one-segment path sends the payload keys too",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/promo?id=7&utm_medium=email",
+      "lookup": "https://myapp.strybok.link/promo?id=7&utm_medium=email"
+    },
+    {
+      "name": "path: an encoded surrogate cannot be decoded: the key is dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=%ED%A0%80&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk"
+    },
+    {
+      "name": "path: an overlong encoding cannot be decoded: the key is dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=%C0%AE&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk"
+    },
+    {
+      "name": "path: a code point above U+10FFFF cannot be decoded: the key is dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=%F4%90%80%80&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk"
+    },
+    {
+      "name": "path: a lone \"%\" in a value cannot be decoded: the key is dropped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=50%&lang=uk",
+      "lookup": "https://myapp.strybok.link/p/1?lang=uk"
+    },
+    {
+      "name": "path: a byte order mark is an ordinary character",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=%EF%BB%BF7",
+      "lookup": "https://myapp.strybok.link/p/1?id=%EF%BB%BF7"
+    },
+    {
+      "name": "path: \"=\" inside a value is part of it",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?id=a=b",
+      "lookup": "https://myapp.strybok.link/p/1?id=a%3Db"
+    },
+    {
+      "name": "path: a key that cannot be decoded is skipped",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?i%zd=7&id=8",
+      "lookup": "https://myapp.strybok.link/p/1?id=8"
+    },
+    {
+      "name": "path: an empty query sends nothing",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1?",
+      "lookup": "https://myapp.strybok.link/p/1"
+    },
+    {
+      "name": "path: a \"?\" inside the fragment starts no query",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/p/1#a?id=7",
+      "lookup": "https://myapp.strybok.link/p/1"
+    },
+    {
+      "name": "path: lower-case escapes in the path are kept as they are",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/caf%c3%a9",
+      "lookup": "https://myapp.strybok.link/caf%c3%a9"
+    },
+    {
+      "name": "path: the scheme is compared without case",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "HTTPS://myapp.strybok.link/product/42?id=7",
+      "lookup": "https://myapp.strybok.link/product/42?id=7"
+    },
+    {
+      "name": "path: /_strybok is a slug, so it is sent (the server refuses it)",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/_strybok",
+      "lookup": "https://myapp.strybok.link/_strybok"
+    },
+    {
+      "name": "path: the root is a route",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/?id=7",
+      "lookup": "https://myapp.strybok.link/?id=7"
+    },
+    {
+      "name": "path: an empty path is read as the root",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link?id=7",
+      "lookup": "https://myapp.strybok.link/?id=7"
+    },
+    {
+      "name": "path: a trailing slash is kept (the server decides)",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/product/",
+      "lookup": "https://myapp.strybok.link/product/"
+    },
+    {
+      "name": "path: the raw path is sent unchanged",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/caf%C3%A9/a:b@c/(1)",
+      "lookup": "https://myapp.strybok.link/caf%C3%A9/a:b@c/(1)"
+    },
+    {
+      "name": "path: \"//\" is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/product//42",
+      "lookup": null
+    },
+    {
+      "name": "path: a \"..\" segment is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a/../b",
+      "lookup": null
+    },
+    {
+      "name": "path: a \".\" segment is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a/./b",
+      "lookup": null
+    },
+    {
+      "name": "path: an encoded dot segment is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a/%2E%2e/b",
+      "lookup": null
+    },
+    {
+      "name": "path: a segment that only starts with a dot is fine",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a/.b",
+      "lookup": "https://myapp.strybok.link/a/.b"
+    },
+    {
+      "name": "path: a malformed escape is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a%2",
+      "lookup": null
+    },
+    {
+      "name": "path: a non-hex escape is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a%zz/b",
+      "lookup": null
+    },
+    {
+      "name": "path: a double quote is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a\"b",
+      "lookup": null
+    },
+    {
+      "name": "path: a raw non-ASCII character is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/café",
+      "lookup": null
+    },
+    {
+      "name": "path: \"|\" is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a|b",
+      "lookup": null
+    },
+    {
+      "name": "path: \"[\" and \"]\" are not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/a[1]",
+      "lookup": null
+    },
+    {
+      "name": "path: /.well-known/… is reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/.well-known/apple-app-site-association",
+      "lookup": null
+    },
+    {
+      "name": "path: /.well-known itself is reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/.well-known",
+      "lookup": null
+    },
+    {
+      "name": "path: /_strybok/… is reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/_strybok/web.js",
+      "lookup": null
+    },
+    {
+      "name": "path: /favicon.ico is reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/favicon.ico",
+      "lookup": null
+    },
+    {
+      "name": "path: /robots.txt is reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/robots.txt",
+      "lookup": null
+    },
+    {
+      "name": "path: only exact file names are reserved",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/favicon.ico/x",
+      "lookup": "https://myapp.strybok.link/favicon.ico/x"
+    },
+    {
+      "name": "path: 512 characters are fine",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "lookup": "https://myapp.strybok.link/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    },
+    {
+      "name": "path: 513 characters are not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "lookup": null
+    },
+    {
+      "name": "path: another host is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://evil.example/product/42",
+      "lookup": null
+    },
+    {
+      "name": "path: http is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "http://myapp.strybok.link/product/42",
+      "lookup": null
+    },
+    {
+      "name": "path: port 443 is fine and not sent",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link:443/product/42?id=7",
+      "lookup": "https://myapp.strybok.link/product/42?id=7"
+    },
+    {
+      "name": "path: another port is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://myapp.strybok.link:8443/product/42",
+      "lookup": null
+    },
+    {
+      "name": "path: user info is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://u@myapp.strybok.link/product/42",
+      "lookup": null
+    },
+    {
+      "name": "long: link (with its payload keys), apn, ibi and utm_* are sent; nothing else",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fproduct%2F42%3Fid%3D7%26secret%3Dx&apn=com.example.app&ibi=com.example.App&isi=123456&ofl=https%3A%2F%2Fexample.com%2Foffer&st=Title&utm_source=newsletter",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fproduct%2F42%3Fid%3D7&apn=com.example.app&ibi=com.example.App&utm_source=newsletter"
+    },
+    {
+      "name": "long: without apn and ibi",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp"
+    },
+    {
+      "name": "long: an empty deep-link path is read as \"/\"",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2F"
+    },
+    {
+      "name": "long: the deep link host is lower-cased",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2FWWW.Example.com%2FP",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fwww.example.com%2FP"
+    },
+    {
+      "name": "long: http deep links are kept as http",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=http%3A%2F%2Fexample.com%2Fp",
+      "lookup": "https://go.example.com/?link=http%3A%2F%2Fexample.com%2Fp"
+    },
+    {
+      "name": "long: the deep link's fragment is never sent",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp%23x",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp"
+    },
+    {
+      "name": "long: a deep link that was not encoded",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https://example.com/p&apn=com.example.app",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn=com.example.app"
+    },
+    {
+      "name": "long: the deep link's payload, ordered and re-encoded",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp%3Flang%3Duk%26id%3Da%2Bb%26x%3D1",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp%3Fid%3Da%2520b%26lang%3Duk"
+    },
+    {
+      "name": "long: user info in the deep link is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fu%3Ap%40example.com%2Fp",
+      "lookup": null
+    },
+    {
+      "name": "long: a port in the deep link is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%3A8443%2Fp",
+      "lookup": null
+    },
+    {
+      "name": "long: another scheme is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=ftp%3A%2F%2Fexample.com%2Fp",
+      "lookup": null
+    },
+    {
+      "name": "long: a dotted IPv4 host passes the host characters (the server refuses it)",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2F192.0.2.1%2Fp",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2F192.0.2.1%2Fp"
+    },
+    {
+      "name": "long: an IP literal in brackets is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%2Fp",
+      "lookup": null
+    },
+    {
+      "name": "long: a deep link that is not a URL is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=hello",
+      "lookup": null
+    },
+    {
+      "name": "long: an empty deep link is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=",
+      "lookup": null
+    },
+    {
+      "name": "long: a space in the decoded deep link is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fa%20b",
+      "lookup": null
+    },
+    {
+      "name": "long: apn and ibi are sent as they are, even empty (the server compares them)",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn=com.example%0A&ibi=",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn=com.example%0A&ibi="
+    },
+    {
+      "name": "long: an apn that cannot be decoded is not ours",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn=%E0%A4",
+      "lookup": null
+    },
+    {
+      "name": "long: a mismatching ibi is sent too (the server refuses it, as the link host does)",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&ibi=com.other.App",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&ibi=com.other.App"
+    },
+    {
+      "name": "long: apn without \"=\" is sent empty",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn="
+    },
+    {
+      "name": "long: the first apn counts",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?apn=com.example.app&link=https%3A%2F%2Fexample.com%2Fp&apn=x",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&apn=com.example.app"
+    },
+    {
+      "name": "long: link need not come first",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?utm_medium=email&link=https%3A%2F%2Fexample.com%2Fp",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp&utm_medium=email"
+    },
+    {
+      "name": "long: the first link counts",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fa&link=https%3A%2F%2Fexample.com%2Fb",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fa"
+    },
+    {
+      "name": "long: only at the root; elsewhere link is an ordinary parameter",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com/product?link=https%3A%2F%2Fexample.com%2Fp",
+      "lookup": "https://go.example.com/product"
+    },
+    {
+      "name": "long: an empty path is the root",
+      "parameterLinks": {
+        "payloadKeys": ["id", "lang"]
+      },
+      "url": "https://go.example.com?link=https%3A%2F%2Fexample.com%2Fp",
+      "lookup": "https://go.example.com/?link=https%3A%2F%2Fexample.com%2Fp"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "no option",
+      "parameterLinks": null,
+      "valid": true
+    },
+    {
+      "name": "no payload keys",
+      "parameterLinks": {
+        "payloadKeys": []
+      },
+      "valid": true
+    },
+    {
+      "name": "letters, digits, \"_\", \".\" and \"-\"",
+      "parameterLinks": {
+        "payloadKeys": ["id", "a.b-c_D9"]
+      },
+      "valid": true
+    },
+    {
+      "name": "20 keys",
+      "parameterLinks": {
+        "payloadKeys": [
+          "k0",
+          "k1",
+          "k2",
+          "k3",
+          "k4",
+          "k5",
+          "k6",
+          "k7",
+          "k8",
+          "k9",
+          "k10",
+          "k11",
+          "k12",
+          "k13",
+          "k14",
+          "k15",
+          "k16",
+          "k17",
+          "k18",
+          "k19"
+        ]
+      },
+      "valid": true
+    },
+    {
+      "name": "keys are case-sensitive: \"ST\" is not \"st\"",
+      "parameterLinks": {
+        "payloadKeys": ["ST"]
+      },
+      "valid": true
+    },
+    {
+      "name": "\"link\" is an ordinary key",
+      "parameterLinks": {
+        "payloadKeys": ["link"]
+      },
+      "valid": true
+    },
+    {
+      "name": "40 characters",
+      "parameterLinks": {
+        "payloadKeys": ["kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"]
+      },
+      "valid": true
+    },
+    {
+      "name": "21 keys",
+      "parameterLinks": {
+        "payloadKeys": [
+          "k0",
+          "k1",
+          "k2",
+          "k3",
+          "k4",
+          "k5",
+          "k6",
+          "k7",
+          "k8",
+          "k9",
+          "k10",
+          "k11",
+          "k12",
+          "k13",
+          "k14",
+          "k15",
+          "k16",
+          "k17",
+          "k18",
+          "k19",
+          "k20"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "an empty key",
+      "parameterLinks": {
+        "payloadKeys": [""]
+      },
+      "valid": false
+    },
+    {
+      "name": "41 characters",
+      "parameterLinks": {
+        "payloadKeys": ["kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"]
+      },
+      "valid": false
+    },
+    {
+      "name": "a space",
+      "parameterLinks": {
+        "payloadKeys": ["a b"]
+      },
+      "valid": false
+    },
+    {
+      "name": "a non-ASCII letter",
+      "parameterLinks": {
+        "payloadKeys": ["é"]
+      },
+      "valid": false
+    },
+    {
+      "name": "utm_ keys are read by Strybok",
+      "parameterLinks": {
+        "payloadKeys": ["utm_source"]
+      },
+      "valid": false
+    },
+    {
+      "name": "utm_ in any case",
+      "parameterLinks": {
+        "payloadKeys": ["UTM_X"]
+      },
+      "valid": false
+    },
+    {
+      "name": "st",
+      "parameterLinks": {
+        "payloadKeys": ["st"]
+      },
+      "valid": false
+    },
+    {
+      "name": "sd",
+      "parameterLinks": {
+        "payloadKeys": ["sd"]
+      },
+      "valid": false
+    },
+    {
+      "name": "si",
+      "parameterLinks": {
+        "payloadKeys": ["si"]
+      },
+      "valid": false
+    },
+    {
+      "name": "strybok_click",
+      "parameterLinks": {
+        "payloadKeys": ["strybok_click"]
+      },
+      "valid": false
+    },
+    {
+      "name": "a key twice",
+      "parameterLinks": {
+        "payloadKeys": ["id", "id"]
+      },
+      "valid": false
+    }
+  ]
+}

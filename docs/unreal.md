@@ -28,6 +28,7 @@ It is the Unreal implementation of the [SDK contract](./sdk-contract.md).
 1. Create an application in Strybok with your iOS and Android identifiers.
 2. Read its setup data: `GET /v1/apps/:appId/integration` returns the managed hostname
    (for example `my-app.strybok.link`).
+   If the application has an active [custom domain](./ios.md#custom-domain-optional), the same answer lists it in `allowedHosts`: declare it in the entitlement and the intent filter next to the managed hostname and pass both to `allowedHosts`.
 3. Check that Strybok serves the association files for that hostname, as described in the
    [iOS](./ios.md#1-tell-strybok-about-the-app) and
    [Android](./android.md#1-tell-strybok-about-the-app) guides (step 1 of each). The native
@@ -91,6 +92,8 @@ LinkHost=my-app.strybok.link
 | `DedupeWindowSeconds`    | `2`                       | The identical URL received again within this window is dropped.                              |
 | `bReportAppOpens`        | `True`                    | Send a best-effort `app_open` event after a link was resolved.                               |
 | `ClientKey`              | empty                     | Publishable key `pk_…`, only for creating links to share (section 6).                        |
+| `bParameterLinks`        | `False`                   | Deliver links without an API call (section 6).                                               |
+| `PayloadKeys`            | empty                     | `parameterLinks.payloadKeys` of the integration guide; used only with `bParameterLinks`.     |
 
 Four more settings belong to [deferred links](#deferred-links-optional) and do nothing unless you
 switch the first one on: `bDeferredLinks` (`False`), `bAllowProbabilisticMatching` (`False`),
@@ -412,6 +415,54 @@ Errors never contain the client key or the payload. `Shutdown`, a new `Configure
 the game instance abandon requests in flight; their `OnComplete` is not called. Do not put
 personal data in a route or payload: whoever receives the link can read them.
 
+### Links without an API call (optional)
+
+New in 0.4.0, **off by default**. The rules are in the tested core; the settings and the
+conversion around them are, like the rest of the module, **not compiled yet**, and nothing of it
+has run on a device. An application can let any address of its hosts open a route of the game
+without creating a link first: **path links** such as `https://my-app.strybok.link/product/42?id=7`
+and **Firebase long links** `https://my-app.strybok.link/?link=…`. The owner switches them on in
+the dashboard and chooses the allowed routes and the query keys that become the payload. Without
+the option the plugin accepts only links with a single slug path, exactly as before, and drops
+these URLs without a request.
+
+To deliver them, copy `parameterLinks` of the integration guide — `GET /v1/apps/:appId/integration`,
+shown on the dashboard's setup screen next to `allowedHosts` — into the Project Settings
+(_Links without an API call_):
+
+```ini
+; Config/DefaultGame.ini
+[/Script/Strybok.StrybokSettings]
+bParameterLinks=True
++PayloadKeys=id
++PayloadKeys=lang
+```
+
+or into `FStrybokConfig` (`bParameterLinks`, `PayloadKeys`) before `Configure`, or into
+`strybok::Config::parameterLinks` of the core. The guide gives `null` while both kinds are off;
+then leave `bParameterLinks` off.
+
+- **What is sent:** the path exactly as received, the first value of each configured key (1–256
+  UTF-16 code units without control characters) and the `utm_*` values; for a long link the deep
+  link rebuilt from its scheme, host and path with only its payload keys, plus `apn` and `ibi`.
+  Nothing else of the URL, and never the fragment.
+- **What you get:** `RoutePath` and `PayloadJson` of the link are what the server read — the route
+  to navigate to, never the tapped path. Treat both as untrusted input (section 8). The `app_open`
+  event carries the `LinkId` of the answer.
+- **Errors:** the server decides which routes, keys and web domains are allowed. With the option,
+  an address of your hosts that is no link (a typo, a bare host) reaches `OnLinkError` as
+  `LinkNotFound`. An invalid list (more than 20 keys, a key twice, a key that is not 1–40
+  characters of `A–Z a–z 0–9 _ . -`, or `utm_…`, `st`, `sd`, `si`, `strybok_click`) makes
+  `Configure` fail with a `Strybok configuration rejected` error in the log, like an unusable
+  `ApiBaseUrl`. Blank entries are ignored.
+- **The keys are compiled into the game.** A key the owner adds later reaches players with your
+  next release; until then installed builds send the keys they know. Never configure a key that
+  carries personal data.
+- **Deferred links** keep the single-slug rule (the answer's URL and a pasted link): the server
+  restores only stored links.
+
+The exact rules are in the [SDK contract](./sdk-contract.md#links-without-an-api-call).
+
 ### Deferred links (optional)
 
 A person taps a link, does not have the game, installs it and opens it: with deferred links the
@@ -640,13 +691,13 @@ not finished, that uses up another of the three attempts.
 
 `ResolveUrl` completes with, and `OnLinkError` receives, an `FStrybokError`:
 
-| `Kind`                | Meaning                                                                                                                                                              |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UnsupportedLink`     | Not `https`, host not allowed, or not a single-slug path. Only from `ResolveUrl`, before any network call. Links from the OS that are not ours are ignored silently. |
-| `LinkNotFound`        | Unknown, disabled or expired link (HTTP 404). Not retried.                                                                                                           |
-| `Timeout` / `Network` | No answer after all retries (e.g. offline). The game keeps working; the link is simply not opened.                                                                   |
-| `Server`              | Unexpected status (`StatusCode`) or malformed response.                                                                                                              |
-| `NotConfigured`       | Unreal only: `ResolveUrl` was called before `Configure` or after `Shutdown`.                                                                                         |
+| `Kind`                | Meaning                                                                                                                                                                                                                             |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UnsupportedLink`     | Not `https`, host not allowed, or not a single-slug path (with `bParameterLinks`: not a route path or long link either). Only from `ResolveUrl`, before any network call. Links from the OS that are not ours are ignored silently. |
+| `LinkNotFound`        | Unknown, disabled or expired link (HTTP 404). Not retried.                                                                                                                                                                          |
+| `Timeout` / `Network` | No answer after all retries (e.g. offline). The game keeps working; the link is simply not opened.                                                                                                                                  |
+| `Server`              | Unexpected status (`StatusCode`) or malformed response.                                                                                                                                                                             |
+| `NotConfigured`       | Unreal only: `ResolveUrl` was called before `Configure` or after `Shutdown`.                                                                                                                                                        |
 
 Errors are also written to the `LogStrybok` category (without the URL, whose query may be
 private).

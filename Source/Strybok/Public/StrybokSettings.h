@@ -79,6 +79,23 @@ public:
 	FString ClientKey;
 
 	/**
+	 * Deliver path links (https://<host>/product/42?id=7) and Firebase long links
+	 * (https://<host>/?link=...). Off by default: then only links with a single slug path are
+	 * ours. Switch it on when the integration guide (the dashboard's setup screen) shows
+	 * parameterLinks, and copy its payloadKeys below.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Links without an API call", meta = (DisplayName = "Links Without an API Call"))
+	bool bParameterLinks = false;
+
+	/**
+	 * parameterLinks.payloadKeys of the integration guide, in its order: the query keys sent with a
+	 * path link. At most 20 keys of A-Z a-z 0-9 _ . -; never a key that carries personal data. Only
+	 * used with the option above; an invalid list makes the configuration fail.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Links without an API call")
+	TArray<FString> PayloadKeys;
+
+	/**
 	 * Restore a link that was tapped before the game was installed. Off by default. With it on, the
 	 * check runs right after start-up; leave it off and call UStrybokSubsystem::EnableDeferredLinks
 	 * instead when the player has to consent first, or when your install referrer sources are

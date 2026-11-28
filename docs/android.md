@@ -49,6 +49,30 @@ fingerprints. An empty array `[]` means the package name or fingerprints are sti
 Declare the whole host (no path filter); the slug is resolved at runtime. The exact snippet with
 your hostname is returned by `GET /v1/apps/:appId/integration`.
 
+### Custom domain (optional)
+
+An application can also serve its links on a subdomain of your own, such as `go.example.com`
+(decision 0020): you add it on the Setup tab under
+**Custom domain** and create the two DNS records shown there — first
+`TXT _strybok-challenge.<hostname>` with the `strybok-verification=…` value, which proves the
+domain is yours, then the CNAME, through which Cloudflare validates the hostname and issues its
+certificate. When both are seen the domain is active, and Strybok serves the same `assetlinks.json` on it. Once it is
+**active**, add a second `<data>` element to the same intent filter and keep the managed one:
+
+```xml
+<data android:scheme="https" android:host="<your managed hostname>" />
+<data android:scheme="https" android:host="go.example.com" />
+```
+
+Add it **only once it is active**: on Android 11 and lower, App Links verification succeeds only
+when every host of the app's `autoVerify` intent filters serves a valid `assetlinks.json`, so a
+host that does not answer yet would turn off App Links for the managed hostname too. Pass both
+hostnames to the SDK's `allowedHosts`. `GET /v1/apps/:appId/integration` returns the intent filter
+with every active custom domain and the list as `allowedHosts`. Release that app version before
+you make the domain **primary** for new link URLs; links already shared with either hostname keep
+working. Custom domains were tried end to end with a real domain on Cloudflare; App Links on a
+custom domain have not been tried on a device yet.
+
 ## 3. Verify on a device
 
 Android verifies the association when the app is installed, and caches the result.
@@ -80,6 +104,10 @@ visible only on the device.
 | Link opens a page from Instagram/TikTok/Facebook | See [Links opened from Instagram, TikTok and other apps](#links-opened-from-instagram-tiktok-and-other-apps).                                                  |
 
 Changing the hostname in the manifest requires shipping an app update.
+
+The dashboard asks Google's Digital Asset Links API about every fingerprint (setup screen,
+"Diagnostics: what Apple and Google see") and simulates a tap on any link (link details, "Test
+this link"), each with what to do.
 
 ### Links opened from Instagram, TikTok and other apps
 

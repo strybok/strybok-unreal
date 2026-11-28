@@ -121,7 +121,8 @@ public:
 
 	/**
 	 * Whether Url looks like a Strybok link of this app: https, a host from the allowed hosts,
-	 * default port, no credentials and a single slug path. False while not configured.
+	 * default port, no credentials and a single slug path (with bParameterLinks also a route path
+	 * or a Firebase long link). False while not configured.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Strybok")
 	bool IsStrybokUrl(const FString& Url) const;
